@@ -8,8 +8,10 @@ import stat
 import sys
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from email.utils import format_datetime, formatdate
+from enum import StrEnum
 from functools import partial
 from mimetypes import guess_type
 from secrets import token_hex
@@ -27,6 +29,75 @@ from starlette.requests import ClientDisconnect
 from starlette.types import Message, Receive, Scope, Send
 
 
+class CookiePolicy(StrEnum):
+    REJECT = "reject"
+    COMPLETE = "complete"
+
+
+CookiePolicyInput = CookiePolicy | Literal["reject", "complete"]
+
+
+@dataclass(frozen=True)
+class _CookiePrefixRequirements:
+    secure: bool = False
+    httponly: bool = False
+    host_bound: bool = False
+
+
+def _normalize_cookie_policy(cookie_policy: CookiePolicyInput | None) -> CookiePolicy | None:
+    if cookie_policy is None:
+        return None
+    try:
+        return CookiePolicy(cookie_policy)
+    except ValueError as exc:
+        allowed = ", ".join(policy.value for policy in CookiePolicy)
+        raise ValueError(f"cookie_policy must be one of: {allowed}") from exc
+
+
+def _prefix_requirements(key: str) -> _CookiePrefixRequirements | None:
+    if key.startswith("__Host-Http-"):
+        return _CookiePrefixRequirements(secure=True, httponly=True, host_bound=True)
+    if key.startswith("__Host-"):
+        return _CookiePrefixRequirements(secure=True, host_bound=True)
+    if key.startswith("__Secure-"):
+        return _CookiePrefixRequirements(secure=True)
+    if key.startswith("__Http-"):
+        return _CookiePrefixRequirements(httponly=True)
+    return None
+
+
+def _apply_cookie_policy(
+    cookie_policy: CookiePolicyInput | None,
+    key: str,
+    path: str | None,
+    domain: str | None,
+    secure: bool,
+    httponly: bool,
+) -> tuple[str | None, str | None, bool, bool]:
+    policy = _normalize_cookie_policy(cookie_policy)
+    requirements = _prefix_requirements(key)
+    if policy is None or requirements is None:
+        return path, domain, secure, httponly
+
+    if requirements.host_bound and domain is not None:
+        raise ValueError(f"Cookie '{key}' with a __Host- prefix must not include a Domain attribute")
+
+    if requirements.secure and not secure:
+        if policy is CookiePolicy.REJECT:
+            raise ValueError(f"Cookie '{key}' with a Secure prefix must include Secure=True")
+        secure = True
+
+    if requirements.httponly and not httponly:
+        if policy is CookiePolicy.REJECT:
+            raise ValueError(f"Cookie '{key}' with an Http prefix must include HttpOnly=True")
+        httponly = True
+
+    if requirements.host_bound and path != "/":
+        raise ValueError(f"Cookie '{key}' with a __Host- prefix must use Path='/'")
+
+    return path, domain, secure, httponly
+
+
 class Response:
     media_type = None
     charset = "utf-8"
@@ -38,11 +109,13 @@ class Response:
         headers: Mapping[str, str] | None = None,
         media_type: str | None = None,
         background: BackgroundTask | None = None,
+        cookie_policy: CookiePolicyInput | None = None,
     ) -> None:
         self.status_code = status_code
         if media_type is not None:
             self.media_type = media_type
         self.background = background
+        self.cookie_policy = _normalize_cookie_policy(cookie_policy)
         self.body = self.render(content)
         self.init_headers(headers)
 
@@ -100,6 +173,15 @@ class Response:
         samesite: Literal["lax", "strict", "none"] | None = "lax",
         partitioned: bool = False,
     ) -> None:
+        path, domain, secure, httponly = _apply_cookie_policy(
+            self.cookie_policy,
+            key,
+            path,
+            domain,
+            secure,
+            httponly,
+        )
+
         cookie: http.cookies.BaseCookie[str] = http.cookies.SimpleCookie()
         cookie[key] = value
         if max_age is not None:
@@ -191,8 +273,9 @@ class JSONResponse(Response):
         headers: Mapping[str, str] | None = None,
         media_type: str | None = None,
         background: BackgroundTask | None = None,
+        cookie_policy: CookiePolicyInput | None = None,
     ) -> None:
-        super().__init__(content, status_code, headers, media_type, background)
+        super().__init__(content, status_code, headers, media_type, background, cookie_policy)
 
     def render(self, content: Any) -> bytes:
         return json.dumps(
@@ -211,8 +294,15 @@ class RedirectResponse(Response):
         status_code: int = 307,
         headers: Mapping[str, str] | None = None,
         background: BackgroundTask | None = None,
+        cookie_policy: CookiePolicyInput | None = None,
     ) -> None:
-        super().__init__(content=b"", status_code=status_code, headers=headers, background=background)
+        super().__init__(
+            content=b"",
+            status_code=status_code,
+            headers=headers,
+            background=background,
+            cookie_policy=cookie_policy,
+        )
         self.headers["location"] = quote(str(url), safe=":/%#?=@[]!$&'()*+,;")
 
 
@@ -232,6 +322,7 @@ class StreamingResponse(Response):
         headers: Mapping[str, str] | None = None,
         media_type: str | None = None,
         background: BackgroundTask | None = None,
+        cookie_policy: CookiePolicyInput | None = None,
     ) -> None:
         if isinstance(content, AsyncIterable):
             self.body_iterator = content
@@ -240,6 +331,7 @@ class StreamingResponse(Response):
         self.status_code = status_code
         self.media_type = self.media_type if media_type is None else media_type
         self.background = background
+        self.cookie_policy = _normalize_cookie_policy(cookie_policy)
         self.init_headers(headers)
 
     async def listen_for_disconnect(self, receive: Receive) -> None:
@@ -310,6 +402,7 @@ class FileResponse(Response):
         filename: str | None = None,
         stat_result: os.stat_result | None = None,
         content_disposition_type: str = "attachment",
+        cookie_policy: CookiePolicyInput | None = None,
     ) -> None:
         self.path = path
         self.status_code = status_code
@@ -318,6 +411,7 @@ class FileResponse(Response):
             media_type = guess_type(filename or path)[0] or "application/octet-stream"
         self.media_type = media_type
         self.background = background
+        self.cookie_policy = _normalize_cookie_policy(cookie_policy)
         self.init_headers(headers)
         self.headers.setdefault("accept-ranges", "bytes")
         if self.filename is not None:
