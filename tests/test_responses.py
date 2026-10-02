@@ -20,7 +20,14 @@ from starlette import status
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
 from starlette.requests import ClientDisconnect, Request
-from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from starlette.responses import (
+    CookiePolicy,
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from starlette.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 from tests.types import TestClientFactory
@@ -671,6 +678,162 @@ def test_delete_cookie_partitioned(partitioned: bool) -> None:
     cookie = SimpleCookie(header)["mycookie"]
     assert cookie["max-age"] == "0"
     assert cookie["secure"] is True
+
+
+@pytest.mark.parametrize(
+    ("key", "secure", "path", "domain", "message"),
+    [
+        ("__Secure-session", False, "/", None, "Secure"),
+        ("__Host-session", False, "/", None, "Secure"),
+        ("__Host-session", True, "/account", None, "Path=/"),
+        ("__Host-session", True, "/", "example.com", "without Domain"),
+        ("__Host-Http-session", True, "/", None, "HttpOnly"),
+        ("__Http-session", False, "/", None, "HttpOnly"),
+    ],
+)
+def test_cookie_policy_rejects_invalid_prefixed_cookies(
+    key: str,
+    secure: bool,
+    path: str,
+    domain: str | None,
+    message: str,
+) -> None:
+    response = Response(cookie_policy=CookiePolicy.REJECT)
+
+    with pytest.raises(ValueError, match=message):
+        response.set_cookie(key, "value", path=path, domain=domain, secure=secure, samesite=None)
+
+    assert response.raw_headers == [(b"content-length", b"0")]
+
+
+def test_cookie_policy_completes_prefixed_cookies() -> None:
+    response = Response(cookie_policy=CookiePolicy.COMPLETE)
+
+    response.set_cookie("__Secure-session", "secure", samesite=None)
+    response.set_cookie("__Host-session", "host", path=None, samesite=None)
+    response.set_cookie("__Http-session", "http-only", samesite=None)
+    response.set_cookie("__Host-Http-session", "host-http-only", path=None, samesite=None)
+
+    set_cookie_headers = [value for name, value in response.raw_headers if name == b"set-cookie"]
+    cookies = [SimpleCookie(value.decode()) for value in set_cookie_headers]
+    assert cookies[0]["__Secure-session"]["secure"] is True
+    assert cookies[1]["__Host-session"]["secure"] is True
+    assert cookies[1]["__Host-session"]["path"] == "/"
+    assert cookies[1]["__Host-session"]["domain"] == ""
+    assert cookies[2]["__Http-session"]["httponly"] is True
+    assert b"; Secure" not in set_cookie_headers[2]
+    assert cookies[3]["__Host-Http-session"]["secure"] is True
+    assert cookies[3]["__Host-Http-session"]["httponly"] is True
+    assert cookies[3]["__Host-Http-session"]["path"] == "/"
+
+
+@pytest.mark.parametrize("domain", ["example.com", ".example.com"])
+def test_cookie_policy_complete_does_not_expand_host_scope(domain: str) -> None:
+    response = Response(cookie_policy=CookiePolicy.COMPLETE)
+
+    with pytest.raises(ValueError, match="Domain"):
+        response.set_cookie("__Host-session", "value", domain=domain, samesite=None)
+
+    with pytest.raises(ValueError, match="Path=/"):
+        response.set_cookie("__Host-session", "value", path="/account", samesite=None)
+
+    assert response.raw_headers == [(b"content-length", b"0")]
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        (
+            "__Http-session",
+            b'__Http-session=""; expires=Thu, 22 Jan 2037 12:00:00 GMT; HttpOnly; Max-Age=0; Path=/',
+        ),
+        (
+            "__Host-session",
+            b'__Host-session=""; expires=Thu, 22 Jan 2037 12:00:00 GMT; Max-Age=0; Path=/; Secure',
+        ),
+        (
+            "__Host-Http-session",
+            b'__Host-Http-session=""; expires=Thu, 22 Jan 2037 12:00:00 GMT; HttpOnly; Max-Age=0; Path=/; Secure',
+        ),
+    ],
+)
+def test_cookie_policy_delete_cookie_uses_prefix_constraints(
+    monkeypatch: pytest.MonkeyPatch, key: str, expected: bytes
+) -> None:
+    mocked_now = dt.datetime(2037, 1, 22, 12, 0, 0, tzinfo=dt.UTC)
+    monkeypatch.setattr(time, "time", lambda: mocked_now.timestamp())
+
+    response = Response(cookie_policy=CookiePolicy.COMPLETE)
+
+    response.delete_cookie(key, samesite=None)
+
+    assert response.raw_headers == [
+        (b"content-length", b"0"),
+        (b"set-cookie", expected),
+    ]
+
+
+def test_cookie_policy_preserves_previous_raw_set_cookie_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    mocked_now = dt.datetime(2037, 1, 22, 12, 0, 0, tzinfo=dt.UTC)
+    monkeypatch.setattr(time, "time", lambda: mocked_now.timestamp())
+
+    response = Response(cookie_policy=CookiePolicy.REJECT)
+    response.set_cookie("__Secure-cookie", "one", path="/one", secure=True, samesite=None)
+    response.set_cookie("__Secure-cookie", "two", path="/two", secure=True, samesite=None)
+    response.delete_cookie("__Host-session", secure=True, httponly=True, samesite=None)
+
+    with pytest.raises(ValueError, match="Domain"):
+        response.delete_cookie("__Host-invalid", domain="example.com", secure=True, httponly=True, samesite=None)
+
+    assert response.raw_headers == [
+        (b"content-length", b"0"),
+        (b"set-cookie", b"__Secure-cookie=one; Path=/one; Secure"),
+        (b"set-cookie", b"__Secure-cookie=two; Path=/two; Secure"),
+        (
+            b"set-cookie",
+            b'__Host-session=""; expires=Thu, 22 Jan 2037 12:00:00 GMT; HttpOnly; Max-Age=0; Path=/; Secure',
+        ),
+    ]
+
+
+def test_cookie_policy_allows_unprefixed_cookies_without_changes() -> None:
+    response = Response(cookie_policy=CookiePolicy.REJECT)
+
+    response.set_cookie("session", "value", path="/account", samesite=None)
+
+    assert response.raw_headers == [
+        (b"content-length", b"0"),
+        (b"set-cookie", b"session=value; Path=/account"),
+    ]
+
+
+def test_cookie_policy_accepts_string_policy() -> None:
+    response = Response(cookie_policy="complete")
+
+    response.set_cookie("__Secure-session", "value", samesite=None)
+
+    assert response.raw_headers == [
+        (b"content-length", b"0"),
+        (b"set-cookie", b"__Secure-session=value; Path=/; Secure"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        JSONResponse({}, cookie_policy=CookiePolicy.COMPLETE),
+        RedirectResponse("/", cookie_policy=CookiePolicy.COMPLETE),
+        StreamingResponse([b"ok"], cookie_policy=CookiePolicy.COMPLETE),
+    ],
+)
+def test_cookie_policy_is_accepted_by_response_subclasses(response: Response) -> None:
+    response.set_cookie("__Secure-session", "value", samesite=None)
+
+    assert response.cookie_policy is CookiePolicy.COMPLETE
+    assert response.raw_headers[-1] == (
+        b"set-cookie",
+        b"__Secure-session=value; Path=/; Secure",
+    )
 
 
 def test_populate_headers(test_client_factory: TestClientFactory) -> None:

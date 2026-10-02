@@ -4,12 +4,13 @@ appropriate ASGI messages on the `send` channel.
 
 ### Response
 
-Signature: `Response(content, status_code=200, headers=None, media_type=None)`
+Signature: `Response(content, status_code=200, headers=None, media_type=None, cookie_policy="allow")`
 
 * `content` - A string or bytestring.
 * `status_code` - An integer HTTP status code.
 * `headers` - A dictionary of strings.
 * `media_type` - A string giving the media type. eg. "text/html"
+* `cookie_policy` - Controls validation of `__Secure-`, `__Host-`, `__Http-`, and `__Host-Http-` cookie name prefixes. Use `"allow"` to retain the default behavior, `"reject"` to raise `ValueError` for invalid attributes, or `"complete"` to add required `Secure` and `HttpOnly` attributes. The `"complete"` policy never adds a `Domain`; a host cookie with a `Domain` or non-root `Path` is still rejected.
 
 Starlette will automatically include a Content-Length header. It will also
 include a Content-Type header, based on the media_type and appending a charset
@@ -43,6 +44,31 @@ Signature: `Response.set_cookie(key, value, max_age=None, expires=None, path="/"
 * `httponly` - A bool indicating that the cookie cannot be accessed via JavaScript through `Document.cookie` property, the `XMLHttpRequest` or `Request` APIs. `Optional`
 * `samesite` - A string that specifies the samesite strategy for the cookie. Valid values are `'lax'`, `'strict'` and `'none'`. Defaults to `'lax'`. `Optional`
 * `partitioned` - A bool that indicates to user agents that these cross-site cookies should only be available in the same top-level context that the cookie was first set in. Only available for Python 3.14+, otherwise an error will be raised. `Optional`
+
+#### Cookie Prefix Policy
+
+Set `cookie_policy` when constructing a response to detect invalid prefixed cookies on the server instead of relying on the browser to discard them. The same policy applies to both `set_cookie` and `delete_cookie`, so an expiration `Set-Cookie` header must satisfy the same prefix constraints as the cookie it removes.
+
+```python
+from starlette.responses import CookiePolicy, Response
+
+response = Response(cookie_policy=CookiePolicy.REJECT)
+response.set_cookie("__Host-session", "value", secure=True, httponly=True)
+```
+
+The accepted prefix rules are:
+
+* `__Secure-` requires `Secure`.
+* `__Host-` requires `Secure`, `Path=/`, and no `Domain` attribute.
+* `__Http-` requires `HttpOnly`.
+* `__Host-Http-` requires `Secure`, `HttpOnly`, `Path=/`, and no `Domain` attribute.
+
+With `CookiePolicy.COMPLETE`, Starlette adds missing `Secure` or `HttpOnly` attributes and supplies `Path=/` when no path was provided. It does not add or remove an explicit `Domain`, and it rejects a `__Host-` or `__Host-Http-` cookie that has an explicit `Domain` or a `Path` other than `/`. Unprefixed cookies keep their existing behavior.
+
+Validation is performed before a new `Set-Cookie` header is appended. If several cookies are set and one is invalid, the previously appended `Set-Cookie` headers remain unchanged.
+
+!!! note "Attribute validation is not a secure-context check"
+    This policy checks cookie attributes and names only. It does not determine whether the response is being sent over HTTPS or another browser-defined secure context; browsers can still reject a cookie according to the request context.
 
 #### Delete Cookie
 
