@@ -289,6 +289,75 @@ def test_request_is_disconnected(test_client_factory: TestClientFactory) -> None
     assert disconnected_after_response
 
 
+@pytest.mark.anyio
+async def test_wait_disconnected_concurrent_observers() -> None:
+    """
+    The body reader and any number of observers can wait for the disconnect
+    notification concurrently without competing for `receive()`. The body is
+    delivered as three ASGI messages, one observer is cancelled midway, and a
+    single `http.disconnect` message notifies the remaining observers.
+    """
+    send_stream, receive_stream = anyio.create_memory_object_stream[Message](0)
+
+    async def receive() -> Message:
+        # Raises `anyio.EndOfStream` once the disconnect message has been
+        # consumed: the test must not rely on the server sending
+        # `http.disconnect` more than once.
+        return await receive_stream.receive()
+
+    request = Request({"type": "http", "method": "POST", "path": "/"}, receive)
+
+    chunks: list[bytes] = []
+    chunk_send, chunk_receive = anyio.create_memory_object_stream[bytes](16)
+
+    async def read_body() -> None:
+        async for chunk in request.stream():
+            if chunk:
+                chunks.append(chunk)
+                await chunk_send.send(chunk)
+
+    observer_scopes: dict[str, anyio.CancelScope] = {}
+    observer_results: dict[str, str] = {}
+
+    async def observe(name: str) -> None:
+        with anyio.CancelScope() as scope:
+            observer_scopes[name] = scope
+            await request.wait_disconnected()
+            observer_results[name] = "notified"
+
+    async def feed(message: Message) -> None:
+        await send_stream.send(message)
+        # Wait until the body-reading path has collected the message, even
+        # if an observer peeked it first and had to hand it over.
+        await chunk_receive.receive()
+
+    async with send_stream, receive_stream, chunk_send, chunk_receive:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(read_body)
+            for name in ("watcher-1", "watcher-2", "watcher-3"):
+                task_group.start_soon(observe, name)
+            await anyio.wait_all_tasks_blocked()
+
+            await feed({"type": "http.request", "body": b"foo", "more_body": True})
+            await feed({"type": "http.request", "body": b"bar", "more_body": True})
+
+            # Cancelling one observer midway must not affect the others, even if
+            # that observer is currently the one blocked in `receive()`.
+            observer_scopes["watcher-2"].cancel()
+
+            await feed({"type": "http.request", "body": b"baz", "more_body": False})
+            await send_stream.send({"type": "http.disconnect"})
+            send_stream.close()
+
+    assert b"".join(chunks) == b"foobarbaz"
+    assert observer_results == {"watcher-1": "notified", "watcher-3": "notified"}
+
+    # The disconnect state is sticky: late joiners are notified immediately
+    # without consuming another message from the (now closed) stream.
+    await request.wait_disconnected()
+    assert await request.is_disconnected() is True
+
+
 def test_request_state_object() -> None:
     scope = {"state": {"old": "foo"}}
 

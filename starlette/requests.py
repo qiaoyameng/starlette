@@ -221,6 +221,23 @@ class Request(HTTPConnection[StateT]):
         self._send = send
         self._stream_consumed = False
         self._is_disconnected = False
+        self._disconnect_event = anyio.Event()
+        # Serializes access to `receive()` so that the body-reading path and
+        # any number of disconnect observers never call it concurrently.
+        self._receive_lock = anyio.Lock()
+        # A single `http.request` message peeked by an observer, waiting to be
+        # handed off to the body-reading path. Buffering is bounded to this
+        # one message, so observing a disconnect never accumulates the body.
+        self._stashed_message: Message | None = None
+        # Set whenever there is no stashed message waiting to be collected.
+        # Replaced with a fresh event on each stash, since `anyio.Event`
+        # cannot be cleared.
+        self._stash_empty = anyio.Event()
+        self._stash_empty.set()
+        # Number of body readers currently waiting for `_receive_lock`.
+        # Observers defer to them instead of polling while a stashed body
+        # message is still waiting to be collected.
+        self._body_readers_waiting = 0
         self._form = None
 
     @property
@@ -231,6 +248,48 @@ class Request(HTTPConnection[StateT]):
     def receive(self) -> Receive:
         return self._receive
 
+    def _set_disconnected(self) -> None:
+        self._is_disconnected = True
+        self._disconnect_event.set()
+
+    async def _next_message(self) -> Message:
+        """
+        Return the next ASGI message for the body-reading path.
+
+        A message stashed by a disconnect observer is replayed first: it was
+        received before anything that follows, and replaying it never calls
+        `receive()`, so it is collected synchronously without `_receive_lock`
+        (there is no `await` between reading and clearing the stash). This
+        guarantees the body-reading path can always make progress, even while
+        an observer is blocked in `receive()` holding the lock. Actual calls
+        to `receive()` are serialized through `_receive_lock`, and once the
+        disconnect state is known an `http.disconnect` message is synthesized
+        instead of consuming another message from the server.
+        """
+        if self._stashed_message is not None:
+            message = self._stashed_message
+            self._stashed_message = None
+            self._stash_empty.set()
+            return message
+        if not self._is_disconnected:
+            self._body_readers_waiting += 1
+            try:
+                async with self._receive_lock:
+                    if self._stashed_message is not None:
+                        message = self._stashed_message
+                        self._stashed_message = None
+                        self._stash_empty.set()
+                        return message
+                    if self._is_disconnected:
+                        return {"type": "http.disconnect"}
+                    message = await self._receive()
+                    if message["type"] == "http.disconnect":
+                        self._set_disconnected()
+                    return message
+            finally:
+                self._body_readers_waiting -= 1
+        return {"type": "http.disconnect"}
+
     async def stream(self) -> AsyncGenerator[bytes, None]:
         if hasattr(self, "_body"):
             yield self._body
@@ -239,7 +298,7 @@ class Request(HTTPConnection[StateT]):
         if self._stream_consumed:
             raise RuntimeError("Stream consumed")
         while not self._stream_consumed:
-            message = await self._receive()
+            message = await self._next_message()
             if message["type"] == "http.request":
                 body = message.get("body", b"")
                 if not message.get("more_body", False):
@@ -247,7 +306,6 @@ class Request(HTTPConnection[StateT]):
                 if body:
                     yield body
             elif message["type"] == "http.disconnect":  # pragma: no branch
-                self._is_disconnected = True
                 raise ClientDisconnect()
         yield b""
 
@@ -327,17 +385,84 @@ class Request(HTTPConnection[StateT]):
 
     async def is_disconnected(self) -> bool:
         if not self._is_disconnected:
-            message: Message = {}
+            if self._stashed_message is not None:
+                # Polling `receive()` here could consume more of the request
+                # body than the single stashed message we may hold on to, so
+                # detection is left to the body-reading path for now.
+                return self._is_disconnected
+            try:
+                # Don't wait for observers blocked in `receive()`: if another
+                # task is receiving right now, it will observe a disconnect
+                # that is already on its way and update the shared state.
+                self._receive_lock.acquire_nowait()
+            except anyio.WouldBlock:
+                return self._is_disconnected
+            try:
+                if self._stashed_message is not None:
+                    return self._is_disconnected
+                message: Message = {}
 
-            # If message isn't immediately available, move on
-            with anyio.CancelScope() as cs:
-                cs.cancel()
-                message = await self._receive()
+                # If message isn't immediately available, move on
+                with anyio.CancelScope() as cs:
+                    cs.cancel()
+                    message = await self._receive()
 
-            if message.get("type") == "http.disconnect":
-                self._is_disconnected = True
-
+                if message.get("type") == "http.disconnect":
+                    self._set_disconnected()
+                elif message.get("type") == "http.request":
+                    # Don't swallow body data: stash it so the body-reading
+                    # path still receives it through `_next_message()`.
+                    self._stashed_message = message
+                    self._stash_empty = anyio.Event()
+            finally:
+                self._receive_lock.release()
         return self._is_disconnected
+
+    async def wait_disconnected(self) -> None:
+        """
+        Wait until the client connection is known to be disconnected.
+
+        Any number of callers may await this concurrently with each other and
+        with the body-reading path: calls to `receive()` are serialized so
+        observers never compete for messages, and every caller is notified
+        through a shared event. Each caller can be cancelled independently
+        without affecting the others, and once the disconnect state has been
+        determined, callers that join later return immediately.
+
+        Observers never swallow `http.request` messages. If an observer peeks
+        a body message, it is stashed for the body-reading path and the
+        observer waits for it to be collected before polling again, so at
+        most one body message is ever buffered. While the request body has
+        not been fully delivered, disconnect detection is therefore driven
+        cooperatively with the body-reading path. Once the body is complete
+        only `http.disconnect` can follow, so observers poll `receive()`
+        directly — unless a body reader is still waiting to collect the
+        stashed final message, in which case they wait for the handoff first.
+        """
+        while not self._is_disconnected:
+            async with self._receive_lock:
+                if self._is_disconnected:
+                    return
+                stashed = self._stashed_message
+                if stashed is None or self._stream_consumed or (
+                    not stashed.get("more_body", False) and not self._body_readers_waiting
+                ):
+                    message = await self._receive()
+                    if message["type"] == "http.disconnect":
+                        self._set_disconnected()
+                        return
+                    # A body message arrived while observing. Stash it for
+                    # the body-reading path instead of swallowing it.
+                    self._stashed_message = message
+                    self._stash_empty = anyio.Event()
+                    continue
+            # A peeked body message is still waiting to be collected by the
+            # body-reading path. Polling again could buffer a second body
+            # message, so wait for the handoff instead. The body reader sets
+            # `_stash_empty` when collecting the stash, which necessarily
+            # happens before it can observe a disconnect itself, so no
+            # disconnect notification can be missed while waiting here.
+            await self._stash_empty.wait()
 
     async def send_push_promise(self, path: str) -> None:
         if "http.response.push" in self.scope.get("extensions", {}):

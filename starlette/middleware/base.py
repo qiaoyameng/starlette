@@ -50,7 +50,7 @@ class _CachedRequest(Request):
                 return {"type": "http.disconnect"}
             # we don't know yet if the client is disconnected or not
             # so we'll wait until we get that message
-            msg = await self.receive()
+            msg = await self._next_message()
             if msg["type"] != "http.disconnect":  # pragma: no cover
                 # at this point a disconnect is all that we should be receiving
                 # if we get something else, things went wrong somewhere

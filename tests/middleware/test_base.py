@@ -972,6 +972,64 @@ async def test_read_request_disconnected_after_consuming_steam() -> None:
     await rcv.aclose()
 
 
+@pytest.mark.anyio
+async def test_wait_disconnected_concurrent_observers_through_middleware() -> None:
+    """
+    Disconnect observers on both sides of a `BaseHTTPMiddleware` (the
+    dispatch function and the downstream endpoint) are notified concurrently
+    while the endpoint consumes the body, delivered as three ASGI messages
+    followed by a single `http.disconnect`.
+    """
+    messages: list[Message] = [
+        {"type": "http.request", "body": b"foo", "more_body": True},
+        {"type": "http.request", "body": b"bar", "more_body": True},
+        {"type": "http.request", "body": b"baz", "more_body": False},
+        {"type": "http.disconnect"},
+    ]
+
+    async def receive() -> Message:
+        assert messages, "receive() called after the disconnect message"
+        return messages.pop(0)
+
+    async def send(msg: Message) -> None:
+        if msg["type"] == "http.response.start":
+            assert msg["status"] == 200
+
+    notified: list[str] = []
+
+    async def endpoint(scope: Scope, receive: Receive, send: Send) -> None:
+        request = Request(scope, receive)
+        body = await request.body()
+        assert body == b"foobarbaz"
+        await request.wait_disconnected()
+        notified.append("endpoint")
+        await Response()(scope, receive, send)
+
+    class ObservingMiddleware(BaseHTTPMiddleware):
+        async def dispatch(
+            self,
+            request: Request,
+            call_next: RequestResponseEndpoint,
+        ) -> Response:
+            async with anyio.create_task_group() as task_group:
+
+                async def observe() -> None:
+                    await request.wait_disconnected()
+                    notified.append("middleware")
+
+                task_group.start_soon(observe)
+                response = await call_next(request)
+            return response
+
+    scope = {"type": "http", "method": "POST", "path": "/"}
+    app: ASGIApp = ObservingMiddleware(endpoint)
+
+    await app(scope, receive, send)
+
+    assert sorted(notified) == ["endpoint", "middleware"]
+    assert messages == []
+
+
 def test_downstream_middleware_modifies_receive(
     test_client_factory: TestClientFactory,
 ) -> None:

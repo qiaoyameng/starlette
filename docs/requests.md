@@ -109,6 +109,40 @@ In some cases such as long-polling, or streaming responses you might need to
 determine if the client has dropped the connection. You can determine this
 state with `disconnected = await request.is_disconnected()`.
 
+#### Disconnect Notifications
+
+A single long-running request often has several tasks that all need to know
+when the client goes away: the body consumer, a progress tracker, or a
+background computation. `await request.wait_disconnected()` provides a shared
+notification that any number of tasks can wait on concurrently, instead of
+each caller polling `receive()` on its own and competing for messages.
+
+```python
+async def app(scope, receive, send):
+    request = Request(scope, receive)
+
+    async def watch_disconnect():
+        await request.wait_disconnected()
+        print("client disconnected")
+
+    ...
+```
+
+Calls to `receive()` are serialized internally, so observers and the
+body-reading path never consume messages at the same time. Observers never
+swallow `http.request` messages: if an observer peeks a body message, it is
+stashed and handed over to the body-reading path, and at most one body
+message is ever buffered this way. While the request body has not been fully
+delivered, disconnect detection is driven cooperatively with the body
+reader — an observer that stashed a partial body message waits for the body
+reader to collect it before polling again. Once the body is complete only
+`http.disconnect` can follow, so observers poll `receive()` directly.
+
+Each caller of `wait_disconnected()` can be cancelled independently without
+affecting the others, and once the disconnect state has been determined,
+callers that join later return immediately. The same guarantees hold for
+requests that pass through `BaseHTTPMiddleware`.
+
 #### Request Files
 
 Request files are normally sent as multipart form data (`multipart/form-data`).
