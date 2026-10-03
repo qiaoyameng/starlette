@@ -177,6 +177,23 @@ async def app(scope, receive, send):
 
 Have in mind that <a href="https://docs.python.org/3/glossary.html#term-file-like-object" target="_blank">file-like</a> objects (like those created by `open()`) are normal iterators. So, you can return them directly in a `StreamingResponse`.
 
+#### Deferring the response headers
+
+By default, `StreamingResponse` sends the response status and headers before the content iterator is consumed. This means that if the iterator raises an exception before producing its first chunk — for example, a database connection that is only established on the first iteration — the client has already received a successful response header, and the error can no longer be turned into an error response.
+
+Passing `defer_headers=True` delays the response start message until the first body chunk is ready. An exception raised before the first chunk propagates to the error middleware, which can replace the response with an error response. An exception raised after the first chunk follows the usual semantics of an already-started stream. If the iterator is empty, the response is sent with the original status code and an empty body.
+
+```python
+from starlette.responses import StreamingResponse
+
+
+async def app(scope, receive, send):
+    assert scope['type'] == 'http'
+    generator = stream_rows_from_database()
+    response = StreamingResponse(generator, media_type='text/plain', defer_headers=True)
+    await response(scope, receive, send)
+```
+
 ### FileResponse
 
 Asynchronously streams a file as the response.

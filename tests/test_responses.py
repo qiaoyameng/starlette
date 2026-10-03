@@ -19,6 +19,7 @@ from python_multipart import MultipartParser
 from starlette import status
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
+from starlette.middleware.errors import ServerErrorMiddleware
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.testclient import TestClient
@@ -854,6 +855,285 @@ async def test_streaming_response_runs_background_on_websocket_scope() -> None:
         "websocket.http.response.body",
         "websocket.http.response.body",
     ]
+
+
+@pytest.mark.anyio
+async def test_streaming_response_defer_headers() -> None:
+    sent: list[Message] = []
+    background_called = False
+
+    async def receive() -> Message:
+        raise NotImplementedError
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    async def stream() -> AsyncIterator[str]:
+        assert not any(message["type"] == "http.response.start" for message in sent)
+        yield "hello"
+        yield ", "
+        yield "world"
+
+    async def run_background() -> None:
+        nonlocal background_called
+        background_called = True
+
+    response = StreamingResponse(stream(), defer_headers=True, background=BackgroundTask(run_background))
+    await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+
+    assert background_called
+    assert sent == [
+        {"type": "http.response.start", "status": 200, "headers": response.raw_headers},
+        {"type": "http.response.body", "body": b"hello", "more_body": True},
+        {"type": "http.response.body", "body": b", ", "more_body": True},
+        {"type": "http.response.body", "body": b"world", "more_body": True},
+        {"type": "http.response.body", "body": b"", "more_body": False},
+    ]
+
+
+@pytest.mark.anyio
+async def test_streaming_response_defer_headers_with_disconnect_listener() -> None:
+    sent: list[Message] = []
+
+    async def receive() -> Message:
+        await anyio.sleep_forever()
+        return {"type": "http.disconnect"}  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    async def stream() -> AsyncIterator[bytes]:
+        yield b"hello"
+
+    response = StreamingResponse(stream(), defer_headers=True)
+    await response({"type": "http"}, receive, send)
+
+    assert [message["type"] for message in sent] == [
+        "http.response.start",
+        "http.response.body",
+        "http.response.body",
+    ]
+
+
+@pytest.mark.anyio
+async def test_streaming_response_defer_headers_empty_iterator() -> None:
+    sent: list[Message] = []
+    background_called = False
+
+    class EmptyStream:
+        def __aiter__(self) -> AsyncIterator[bytes]:
+            return self
+
+        async def __anext__(self) -> bytes:
+            raise StopAsyncIteration
+
+    async def receive() -> Message:
+        raise NotImplementedError
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    async def run_background() -> None:
+        nonlocal background_called
+        background_called = True
+
+    response = StreamingResponse(
+        EmptyStream(), status_code=202, defer_headers=True, background=BackgroundTask(run_background)
+    )
+    await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+
+    assert background_called
+    assert sent == [
+        {"type": "http.response.start", "status": 202, "headers": response.raw_headers},
+        {"type": "http.response.body", "body": b"", "more_body": False},
+    ]
+
+
+@pytest.mark.anyio
+async def test_streaming_response_defer_headers_sync_iterator() -> None:
+    sent: list[Message] = []
+    producer_released = False
+
+    def stream() -> Iterator[bytes]:
+        nonlocal producer_released
+        try:
+            yield b"hello"
+            yield b"world"
+        finally:
+            producer_released = True
+
+    async def receive() -> Message:
+        raise NotImplementedError
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    response = StreamingResponse(stream(), defer_headers=True)
+    await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+
+    assert producer_released
+    assert [message["type"] for message in sent] == [
+        "http.response.start",
+        "http.response.body",
+        "http.response.body",
+        "http.response.body",
+    ]
+    body = b"".join(message.get("body", b"") for message in sent if message["type"] == "http.response.body")
+    assert body == b"helloworld"
+
+
+@pytest.mark.anyio
+async def test_streaming_response_defer_headers_error_before_first_chunk() -> None:
+    sent: list[Message] = []
+    producer_released = False
+    background_called = False
+
+    async def receive() -> Message:
+        raise NotImplementedError
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    async def stream() -> AsyncIterator[bytes]:
+        nonlocal producer_released
+        try:
+            raise RuntimeError("database connection failed")
+            yield b""  # pragma: no cover
+        finally:
+            producer_released = True
+
+    async def run_background() -> None:
+        nonlocal background_called
+        background_called = True
+
+    response = StreamingResponse(stream(), defer_headers=True, background=BackgroundTask(run_background))
+    with pytest.raises(RuntimeError, match="database connection failed"):
+        await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+
+    assert producer_released
+    assert not background_called
+    assert sent == []
+
+
+@pytest.mark.anyio
+async def test_streaming_response_defer_headers_error_before_first_chunk_allows_error_response() -> None:
+    sent: list[Message] = []
+
+    async def receive() -> Message:
+        raise NotImplementedError
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    async def stream() -> AsyncIterator[bytes]:
+        raise RuntimeError("database connection failed")
+        yield b""  # pragma: no cover
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        response = StreamingResponse(stream(), defer_headers=True)
+        await response(scope, receive, send)
+
+    middleware = ServerErrorMiddleware(app)
+    scope: Scope = {"type": "http", "asgi": {"spec_version": "2.4"}}
+    with pytest.raises(RuntimeError, match="database connection failed"):
+        await middleware(scope, receive, send)
+
+    response_starts = [message for message in sent if message["type"] == "http.response.start"]
+    assert len(response_starts) == 1
+    assert response_starts[0]["status"] == 500
+
+
+@pytest.mark.anyio
+async def test_streaming_response_defer_headers_error_after_first_chunk() -> None:
+    sent: list[Message] = []
+    producer_released = False
+
+    async def receive() -> Message:
+        raise NotImplementedError
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    async def stream() -> AsyncIterator[bytes]:
+        nonlocal producer_released
+        try:
+            yield b"hello"
+            raise RuntimeError("database connection failed")
+        finally:
+            producer_released = True
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        response = StreamingResponse(stream(), defer_headers=True)
+        await response(scope, receive, send)
+
+    middleware = ServerErrorMiddleware(app)
+    scope: Scope = {"type": "http", "asgi": {"spec_version": "2.4"}}
+    with pytest.raises(RuntimeError, match="database connection failed"):
+        await middleware(scope, receive, send)
+
+    assert producer_released
+    response_starts = [message for message in sent if message["type"] == "http.response.start"]
+    assert len(response_starts) == 1
+    assert response_starts[0]["status"] == 200
+    assert sent[1] == {"type": "http.response.body", "body": b"hello", "more_body": True}
+    assert not any(message["type"] == "http.response.body" and not message.get("more_body") for message in sent)
+
+
+@pytest.mark.anyio
+async def test_streaming_response_defer_headers_releases_producer_on_disconnect() -> None:
+    producer_released = False
+    streamed = 0
+
+    async def receive() -> Message:
+        raise NotImplementedError
+
+    async def send(message: Message) -> None:
+        nonlocal streamed
+        if message["type"] == "http.response.body":
+            streamed += 1
+            if streamed == 2:
+                raise OSError
+
+    async def stream() -> AsyncIterator[bytes]:
+        nonlocal producer_released
+        try:
+            while True:
+                yield b"chunk"
+        finally:
+            producer_released = True
+
+    response = StreamingResponse(stream(), defer_headers=True)
+    with pytest.raises(ClientDisconnect):
+        await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+
+    assert producer_released
+
+
+@pytest.mark.anyio
+async def test_streaming_response_defer_headers_releases_producer_on_cancellation() -> None:
+    producer_released = False
+
+    async def receive() -> Message:
+        raise NotImplementedError
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body" and message.get("more_body"):
+            cancel_scope.cancel()
+
+    async def stream() -> AsyncIterator[bytes]:
+        nonlocal producer_released
+        try:
+            yield b"chunk"
+            await anyio.sleep_forever()
+        finally:
+            producer_released = True
+
+    response = StreamingResponse(stream(), defer_headers=True)
+    with anyio.CancelScope() as cancel_scope:
+        await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+
+    assert cancel_scope.cancel_called
+    assert producer_released
 
 
 README = """\

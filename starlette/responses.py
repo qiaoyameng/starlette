@@ -232,6 +232,7 @@ class StreamingResponse(Response):
         headers: Mapping[str, str] | None = None,
         media_type: str | None = None,
         background: BackgroundTask | None = None,
+        defer_headers: bool = False,
     ) -> None:
         if isinstance(content, AsyncIterable):
             self.body_iterator = content
@@ -240,6 +241,7 @@ class StreamingResponse(Response):
         self.status_code = status_code
         self.media_type = self.media_type if media_type is None else media_type
         self.background = background
+        self.defer_headers = defer_headers
         self.init_headers(headers)
 
     async def listen_for_disconnect(self, receive: Receive) -> None:
@@ -248,14 +250,37 @@ class StreamingResponse(Response):
             if message["type"] == "http.disconnect":
                 break
 
-    async def stream_response(self, send: Send) -> None:
-        await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
-        async for chunk in self.body_iterator:
-            if not isinstance(chunk, bytes | memoryview):
-                chunk = chunk.encode(self.charset)
-            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+    async def _send_body_chunk(self, send: Send, chunk: Content) -> None:
+        if not isinstance(chunk, bytes | memoryview):
+            chunk = chunk.encode(self.charset)
+        await send({"type": "http.response.body", "body": chunk, "more_body": True})
 
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
+    async def stream_response(self, send: Send) -> None:
+        if not self.defer_headers:
+            await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+            async for chunk in self.body_iterator:
+                await self._send_body_chunk(send, chunk)
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+            return
+
+        iterator = self.body_iterator.__aiter__()
+        try:
+            try:
+                chunk: Content | None = await iterator.__anext__()
+            except StopAsyncIteration:
+                chunk = None
+            await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+            while chunk is not None:
+                await self._send_body_chunk(send, chunk)
+                try:
+                    chunk = await iterator.__anext__()
+                except StopAsyncIteration:
+                    chunk = None
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        finally:
+            aclose = getattr(iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "websocket":

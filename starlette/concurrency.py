@@ -52,8 +52,13 @@ async def iterate_in_threadpool(
     iterator: Iterable[T],
 ) -> AsyncIterator[T]:
     as_iterator = iter(iterator)
-    while True:
-        try:
-            yield await anyio.to_thread.run_sync(_next, as_iterator)
-        except _StopIteration:
-            break
+    try:
+        while True:
+            try:
+                yield await anyio.to_thread.run_sync(_next, as_iterator)
+            except _StopIteration:
+                break
+    finally:
+        close = getattr(as_iterator, "close", None)
+        if close is not None:
+            close()
