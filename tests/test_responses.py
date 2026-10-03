@@ -762,6 +762,186 @@ def test_streaming_response_memoryview(test_client_factory: TestClientFactory) -
     assert response.content == b"\xc0\xf5"
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.time = 0.0
+        self.cancel_scopes: list[FakeCancelScope] = []
+
+    def current_time(self) -> float:
+        return self.time
+
+    def advance(self, seconds: float) -> None:
+        self.time += seconds
+        for cancel_scope in self.cancel_scopes:
+            if not cancel_scope.exited and cancel_scope.deadline <= self.time:
+                cancel_scope.cancel()
+
+
+class FakeCancelScope:
+    def __init__(self, deadline: float) -> None:
+        self.deadline = deadline
+        self.exited = False
+        self._cancel_scope = anyio.CancelScope()
+
+    def __enter__(self) -> FakeCancelScope:
+        self._cancel_scope.__enter__()
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        self.exited = True
+        return bool(self._cancel_scope.__exit__(exc_type, exc_value, traceback))
+
+    def cancel(self) -> None:
+        self._cancel_scope.cancel()
+
+    @property
+    def cancel_called(self) -> bool:
+        return self._cancel_scope.cancel_called
+
+
+def test_streaming_response_rejects_non_positive_coalescing_limits() -> None:
+    with pytest.raises(ValueError, match="max_buffer_size"):
+        StreamingResponse(iter([]), max_buffer_size=0)
+
+    with pytest.raises(ValueError, match="buffer_timeout"):
+        StreamingResponse(iter([]), buffer_timeout=0)
+
+
+@pytest.mark.anyio
+async def test_streaming_response_coalesces_chunks_with_fake_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    first_chunk = anyio.Event()
+    second_chunk = anyio.Event()
+    third_chunk = anyio.Event()
+    finished = anyio.Event()
+    sent: list[tuple[float, int, object]] = []
+
+    async def generate() -> AsyncIterator[bytes]:
+        await first_chunk.wait()
+        yield b"a"
+        await second_chunk.wait()
+        yield b"b"
+        await third_chunk.wait()
+        yield b"c"
+        await finished.wait()
+
+    async def receive() -> Message:
+        raise NotImplementedError
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body":
+            sent.append((clock.time, len(message["body"]), message["body"]))
+
+    response = StreamingResponse(generate(), max_buffer_size=2, buffer_timeout=1)
+    monkeypatch.setattr(anyio, "current_time", clock.current_time)
+
+    def move_on_after(delay: float) -> FakeCancelScope:
+        cancel_scope = FakeCancelScope(clock.time + delay)
+        clock.cancel_scopes.append(cancel_scope)
+        return cancel_scope
+
+    monkeypatch.setattr(anyio, "move_on_after", move_on_after)
+
+    scope = {"type": "http", "asgi": {"spec_version": "2.4"}}
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(response, scope, receive, send)
+        await anyio.wait_all_tasks_blocked()
+
+        first_chunk.set()
+        await anyio.wait_all_tasks_blocked()
+        second_chunk.set()
+        await anyio.wait_all_tasks_blocked()
+        third_chunk.set()
+        await anyio.wait_all_tasks_blocked()
+
+        clock.advance(1)
+        await anyio.wait_all_tasks_blocked()
+        clock.advance(4)
+        finished.set()
+        await anyio.wait_all_tasks_blocked()
+
+    assert [(time, size) for time, size, _ in sent] == [(0, 2), (1, 1), (5, 0)]
+    assert sent[0][2] == b"ab"
+    assert sent[1][2] == b"c"
+
+
+@pytest.mark.anyio
+async def test_streaming_response_does_not_copy_large_chunk() -> None:
+    large_chunk = memoryview(b"large chunk")
+    sent: list[bytes | memoryview] = []
+
+    async def generate() -> AsyncIterator[memoryview]:
+        yield memoryview(b"ab")
+        yield large_chunk
+
+    async def receive() -> Message:
+        raise NotImplementedError
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body":
+            sent.append(message["body"])
+
+    response = StreamingResponse(generate(), max_buffer_size=4)
+    await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+
+    assert sent[:-1] == [b"ab", large_chunk]
+
+
+@pytest.mark.anyio
+async def test_streaming_response_empty_chunk_does_not_reset_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    first_chunk = anyio.Event()
+    empty_chunk = anyio.Event()
+    finished = anyio.Event()
+    sent: list[tuple[float, int]] = []
+
+    async def generate() -> AsyncIterator[bytes]:
+        await first_chunk.wait()
+        yield b"a"
+        await empty_chunk.wait()
+        yield b""
+        await finished.wait()
+
+    async def receive() -> Message:
+        raise NotImplementedError
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body":
+            sent.append((clock.time, len(message["body"])))
+
+    response = StreamingResponse(generate(), max_buffer_size=10, buffer_timeout=1)
+
+    def move_on_after(delay: float) -> FakeCancelScope:
+        cancel_scope = FakeCancelScope(clock.time + delay)
+        clock.cancel_scopes.append(cancel_scope)
+        return cancel_scope
+
+    monkeypatch.setattr(anyio, "current_time", clock.current_time)
+    monkeypatch.setattr(anyio, "move_on_after", move_on_after)
+
+    scope = {"type": "http", "asgi": {"spec_version": "2.4"}}
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(response, scope, receive, send)
+        await anyio.wait_all_tasks_blocked()
+        first_chunk.set()
+        await anyio.wait_all_tasks_blocked()
+
+        clock.advance(0.5)
+        empty_chunk.set()
+        await anyio.wait_all_tasks_blocked()
+        clock.advance(0.5)
+        await anyio.wait_all_tasks_blocked()
+        clock.advance(10)
+        finished.set()
+        await anyio.wait_all_tasks_blocked()
+
+    assert sent == [(1, 1), (11, 0)]
+
+
 @pytest.mark.anyio
 async def test_streaming_response_stops_if_receiving_http_disconnect() -> None:
     streamed = 0
@@ -824,6 +1004,95 @@ async def test_streaming_response_on_client_disconnects() -> None:
     assert not cancel_scope.cancel_called, "Content streaming should stop itself."
     assert chunks == b"chunk"
     await stream.aclose()
+
+
+@pytest.mark.anyio
+async def test_streaming_response_blocked_send_backpressures_producer() -> None:
+    send_started = anyio.Event()
+    allow_send = anyio.Event()
+    second_chunk_produced = anyio.Event()
+
+    async def generate() -> AsyncIterator[bytes]:
+        yield b"full"
+        second_chunk_produced.set()
+        await anyio.sleep_forever()
+
+    async def receive() -> Message:
+        raise NotImplementedError
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body" and message.get("more_body"):
+            send_started.set()
+            await allow_send.wait()
+
+    response = StreamingResponse(generate(), max_buffer_size=4)
+    scope = {"type": "http", "asgi": {"spec_version": "2.4"}}
+
+    with anyio.CancelScope() as cancel_scope:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(response, scope, receive, send)
+            await send_started.wait()
+            await anyio.wait_all_tasks_blocked()
+            assert not second_chunk_produced.is_set()
+
+            allow_send.set()
+            await second_chunk_produced.wait()
+            cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_streaming_response_disconnect_cancels_coalesced_stream() -> None:
+    generator_closed = anyio.Event()
+    disconnected = anyio.Event()
+    sent: list[Message] = []
+
+    async def receive() -> Message:
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    async def generate() -> AsyncIterator[bytes]:
+        try:
+            yield b"pending"
+            await anyio.sleep_forever()
+        finally:
+            await anyio.sleep(0)
+            generator_closed.set()
+
+    response = StreamingResponse(generate(), max_buffer_size=100, buffer_timeout=1)
+
+    async def disconnect() -> None:
+        disconnected.set()
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(response, {"type": "http"}, receive, send)
+        task_group.start_soon(disconnect)
+
+    assert generator_closed.is_set()
+    assert [message["type"] for message in sent] == ["http.response.start"]
+
+
+@pytest.mark.anyio
+async def test_streaming_response_generator_failure_discards_pending_buffer() -> None:
+    sent: list[Message] = []
+
+    async def generate() -> AsyncIterator[bytes]:
+        yield b"pending"
+        raise RuntimeError("generator failed")
+
+    async def receive() -> Message:
+        raise NotImplementedError
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    response = StreamingResponse(generate(), max_buffer_size=100, buffer_timeout=0.01)
+    with pytest.raises(RuntimeError, match="generator failed"):
+        await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+
+    assert [message["type"] for message in sent] == ["http.response.start"]
 
 
 @pytest.mark.anyio

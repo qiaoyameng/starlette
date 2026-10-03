@@ -7,7 +7,7 @@ import os
 import stat
 import sys
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from email.utils import format_datetime, formatdate
 from functools import partial
@@ -232,7 +232,14 @@ class StreamingResponse(Response):
         headers: Mapping[str, str] | None = None,
         media_type: str | None = None,
         background: BackgroundTask | None = None,
+        max_buffer_size: int | None = None,
+        buffer_timeout: float | None = None,
     ) -> None:
+        if max_buffer_size is not None and max_buffer_size <= 0:
+            raise ValueError("max_buffer_size must be a positive integer")
+        if buffer_timeout is not None and buffer_timeout <= 0:
+            raise ValueError("buffer_timeout must be a positive number of seconds")
+
         if isinstance(content, AsyncIterable):
             self.body_iterator = content
         else:
@@ -240,6 +247,8 @@ class StreamingResponse(Response):
         self.status_code = status_code
         self.media_type = self.media_type if media_type is None else media_type
         self.background = background
+        self.max_buffer_size = max_buffer_size
+        self.buffer_timeout = buffer_timeout
         self.init_headers(headers)
 
     async def listen_for_disconnect(self, receive: Receive) -> None:
@@ -248,14 +257,140 @@ class StreamingResponse(Response):
             if message["type"] == "http.disconnect":
                 break
 
-    async def stream_response(self, send: Send) -> None:
+    async def stream_response(self, send: Send, receive: Receive | None = None) -> None:
         await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+
+        if self.max_buffer_size is None and self.buffer_timeout is None:
+            await self._stream_response(send)
+            return
+
+        await self._coalesce_stream(send, receive)
+
+    async def _stream_response(self, send: Send) -> None:
         async for chunk in self.body_iterator:
             if not isinstance(chunk, bytes | memoryview):
                 chunk = chunk.encode(self.charset)
             await send({"type": "http.response.body", "body": chunk, "more_body": True})
 
         await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    async def _coalesce_stream(self, send: Send, receive: Receive | None = None) -> None:
+        chunk_sender, chunk_receiver = anyio.create_memory_object_stream[
+            tuple[bytes | memoryview, anyio.Event] | None
+        ](0)
+        control_sender, control_receiver = anyio.create_memory_object_stream[str](0)
+
+        max_buffer_size = self.max_buffer_size
+        buffer_timeout = self.buffer_timeout
+        buffer: list[bytes | memoryview] = []
+        buffered_size = 0
+        deadline: float | None = None
+        body_iterator = self.body_iterator.__aiter__()
+
+        async def produce() -> None:
+            try:
+                while True:
+                    try:
+                        chunk = await body_iterator.__anext__()
+                    except StopAsyncIteration:
+                        break
+
+                    if not isinstance(chunk, bytes | memoryview):
+                        chunk = chunk.encode(self.charset)
+                    if chunk:
+                        acknowledged = anyio.Event()
+                        await chunk_sender.send((chunk, acknowledged))
+                        await acknowledged.wait()
+                    else:
+                        await anyio.sleep(0)
+            finally:
+                aclose = getattr(body_iterator, "aclose", None)
+                if aclose is not None:
+                    with anyio.CancelScope(shield=True), suppress(StopAsyncIteration):
+                        await aclose()
+
+            await chunk_sender.send(None)
+
+        async def disconnect(receive: Receive) -> None:
+            await self.listen_for_disconnect(receive)
+            await control_sender.send("disconnect")
+
+        async def consume() -> None:
+            nonlocal buffered_size, deadline
+
+            while True:
+                deadline_cancelled = False
+                item: tuple[bytes | memoryview, anyio.Event] | None = None
+                if deadline is None:
+                    item = await chunk_receiver.receive()
+                else:
+                    remaining_time = deadline - anyio.current_time()
+                    with anyio.move_on_after(remaining_time) as timeout_scope:
+                        item = await chunk_receiver.receive()
+                    deadline_cancelled = timeout_scope.cancel_called
+
+                if deadline_cancelled:
+                    if anyio.current_time() >= deadline:
+                        await flush_buffer()
+                        continue
+                    raise anyio.get_cancelled_exc_class()()
+
+                if item is None:
+                    await flush_buffer()
+                    await send({"type": "http.response.body", "body": b"", "more_body": False})
+                    await control_sender.send("done")
+                    return
+
+                chunk, acknowledged = item
+                chunk_size = len(chunk)
+                try:
+                    if max_buffer_size is not None and (
+                        buffered_size >= max_buffer_size or chunk_size >= max_buffer_size
+                    ):
+                        await flush_buffer()
+                        await send_body(chunk)
+                    else:
+                        buffer.append(chunk)
+                        buffered_size += chunk_size
+                        if deadline is None:
+                            deadline = (
+                                anyio.current_time() + buffer_timeout
+                                if buffer_timeout is not None
+                                else None
+                            )
+                        if max_buffer_size is not None and buffered_size >= max_buffer_size:
+                            await flush_buffer()
+                finally:
+                    acknowledged.set()
+
+        async def send_body(chunk: bytes | memoryview) -> None:
+            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+
+        async def flush_buffer() -> None:
+            nonlocal buffered_size, deadline
+            if not buffer:
+                deadline = None
+                return
+
+            body = b"".join(buffer) if len(buffer) > 1 else buffer[0]
+            buffer.clear()
+            buffered_size = 0
+            deadline = None
+            await send_body(body)
+
+        try:
+            async with create_collapsing_task_group() as task_group:
+                if receive is not None:
+                    task_group.start_soon(disconnect, receive)
+                task_group.start_soon(produce)
+                task_group.start_soon(consume)
+                await control_receiver.receive()
+                task_group.cancel_scope.cancel()
+        finally:
+            chunk_sender.close()
+            chunk_receiver.close()
+            control_sender.close()
+            control_receiver.close()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "websocket":
@@ -266,6 +401,7 @@ class StreamingResponse(Response):
             return
 
         spec_version = tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split(".")))
+        coalescing_enabled = self.max_buffer_size is not None or self.buffer_timeout is not None
 
         if spec_version >= (2, 4):
             try:
@@ -273,14 +409,17 @@ class StreamingResponse(Response):
             except OSError:
                 raise ClientDisconnect()
         else:
-            async with create_collapsing_task_group() as task_group:
+            if not coalescing_enabled:
+                async with create_collapsing_task_group() as task_group:
 
-                async def wrap(func: Callable[[], Awaitable[None]]) -> None:
-                    await func()
-                    task_group.cancel_scope.cancel()
+                    async def wrap(func: Callable[[], Awaitable[None]]) -> None:
+                        await func()
+                        task_group.cancel_scope.cancel()
 
-                task_group.start_soon(wrap, partial(self.stream_response, send))
-                await wrap(partial(self.listen_for_disconnect, receive))
+                    task_group.start_soon(wrap, partial(self.stream_response, send))
+                    await wrap(partial(self.listen_for_disconnect, receive))
+            else:
+                await self.stream_response(send, receive)
 
         if self.background is not None:
             await self.background()

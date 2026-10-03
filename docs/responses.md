@@ -177,6 +177,19 @@ async def app(scope, receive, send):
 
 Have in mind that <a href="https://docs.python.org/3/glossary.html#term-file-like-object" target="_blank">file-like</a> objects (like those created by `open()`) are normal iterators. So, you can return them directly in a `StreamingResponse`.
 
+Small chunks can be coalesced before they are sent by setting either `max_buffer_size`, `buffer_timeout`, or both.
+
+```python
+response = StreamingResponse(
+    generator,
+    media_type="text/html",
+    max_buffer_size=64 * 1024,
+    buffer_timeout=0.1,
+)
+```
+
+The response sends buffered data as soon as the first configured limit is reached. When only the timeout is configured, data is sent after that duration even if no additional chunks arrive. Chunks that already meet the size limit are sent directly, without first copying them into the full buffer.
+
 ### FileResponse
 
 Asynchronously streams a file as the response.
