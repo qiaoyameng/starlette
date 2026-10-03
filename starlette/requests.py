@@ -211,6 +211,122 @@ async def empty_send(message: Message) -> NoReturn:
     raise RuntimeError("Send channel has not been made available")
 
 
+class _ReceiveChannel:
+    def __init__(self, receive: Receive) -> None:
+        self._receive = receive
+        self._message: Message | None = None
+        self._condition = anyio.Condition()
+        self._receiving = False
+        self._disconnected = anyio.Event()
+        self._observer_count = 0
+
+    async def _receive_as_leader(self) -> None:
+        try:
+            message = await self._receive()
+        except BaseException:
+            async with self._condition:
+                self._receiving = False
+                self._condition.notify_all()
+            raise
+
+        async with self._condition:
+            self._receiving = False
+            if message["type"] == "http.disconnect":
+                self._disconnected.set()
+            else:
+                self._message = message
+            self._condition.notify_all()
+
+    async def get_body_message(self) -> Message:
+        while True:
+            async with self._condition:
+                if self._disconnected.is_set():
+                    return {"type": "http.disconnect"}
+                if self._message is not None:
+                    message = self._message
+                    self._message = None
+                    self._condition.notify_all()
+                    return message
+                if not self._receiving:
+                    self._receiving = True
+                    should_receive = True
+                else:
+                    should_receive = False
+
+            if should_receive:
+                await self._receive_as_leader()
+                continue
+
+            async with self._condition:
+                if self._disconnected.is_set():
+                    return {"type": "http.disconnect"}
+                if self._message is not None:
+                    continue
+                await self._condition.wait()
+
+    async def poll_disconnected(self) -> bool:
+        async with self._condition:
+            if self._disconnected.is_set():
+                return True
+            if self._message is not None:
+                return self._message["type"] == "http.disconnect"
+            if self._receiving:
+                return False
+            self._receiving = True
+            should_receive = True
+
+        if not should_receive:
+            return False
+
+        try:
+            with anyio.CancelScope() as cancel_scope:
+                cancel_scope.cancel()
+                message = await self._receive()
+        except anyio.get_cancelled_exc_class():
+            async with self._condition:
+                self._receiving = False
+                self._condition.notify_all()
+            return False
+
+        async with self._condition:
+            self._receiving = False
+            if message["type"] == "http.disconnect":
+                self._disconnected.set()
+            else:
+                self._message = message
+            self._condition.notify_all()
+
+        return message["type"] == "http.disconnect"
+
+    async def wait_for_disconnect(self) -> None:
+        async with self._condition:
+            self._observer_count += 1
+
+        try:
+            while True:
+                async with self._condition:
+                    if self._disconnected.is_set():
+                        return
+                    if self._message is None and not self._receiving:
+                        self._receiving = True
+                        should_receive = True
+                    else:
+                        should_receive = False
+
+                if should_receive:
+                    await self._receive_as_leader()
+                    continue
+
+                async with self._condition:
+                    if self._disconnected.is_set():
+                        return
+                    await self._condition.wait()
+        finally:
+            async with self._condition:
+                self._observer_count -= 1
+                self._condition.notify_all()
+
+
 class Request(HTTPConnection[StateT]):
     _form: FormData | None
 
@@ -219,6 +335,7 @@ class Request(HTTPConnection[StateT]):
         assert scope["type"] == "http"
         self._receive = receive
         self._send = send
+        self._receive_channel = _ReceiveChannel(receive)
         self._stream_consumed = False
         self._is_disconnected = False
         self._form = None
@@ -239,7 +356,7 @@ class Request(HTTPConnection[StateT]):
         if self._stream_consumed:
             raise RuntimeError("Stream consumed")
         while not self._stream_consumed:
-            message = await self._receive()
+            message = await self._receive_channel.get_body_message()
             if message["type"] == "http.request":
                 body = message.get("body", b"")
                 if not message.get("more_body", False):
@@ -327,17 +444,13 @@ class Request(HTTPConnection[StateT]):
 
     async def is_disconnected(self) -> bool:
         if not self._is_disconnected:
-            message: Message = {}
-
-            # If message isn't immediately available, move on
-            with anyio.CancelScope() as cs:
-                cs.cancel()
-                message = await self._receive()
-
-            if message.get("type") == "http.disconnect":
-                self._is_disconnected = True
+            self._is_disconnected = await self._receive_channel.poll_disconnected()
 
         return self._is_disconnected
+
+    async def wait_for_disconnect(self) -> None:
+        await self._receive_channel.wait_for_disconnect()
+        self._is_disconnected = True
 
     async def send_push_promise(self, path: str) -> None:
         if "http.response.push" in self.scope.get("extensions", {}):
