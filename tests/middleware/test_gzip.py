@@ -4,6 +4,7 @@ import hashlib
 import zlib
 from pathlib import Path
 
+import anyio
 import pytest
 
 from starlette.applications import Starlette
@@ -253,6 +254,64 @@ async def test_gzip_ignored_for_pathsend_responses(tmpdir: Path) -> None:
     assert len(events) == 2
     assert events[0]["type"] == "http.response.start"
     assert events[1]["type"] == "http.response.pathsend"
+
+
+@pytest.mark.anyio
+async def test_gzip_zerocopysend_falls_back_to_body_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "example.txt"
+    path.write_bytes(b"x" * 4000)
+
+    class FakeAsyncFile:
+        def __init__(self, path: str) -> None:
+            self.file = open(path, "rb")
+
+        async def read(self, size: int) -> bytes:
+            return self.file.read(size)
+
+        async def seek(self, offset: int) -> int:
+            return self.file.seek(offset)
+
+        async def aclose(self) -> None:
+            self.file.close()
+
+    async def open_file(path: str, mode: str) -> FakeAsyncFile:
+        assert mode == "rb"
+        return FakeAsyncFile(path)
+
+    monkeypatch.setattr(anyio, "open_file", open_file)
+
+    async def endpoint_with_zerocopysend(request: Request) -> FileResponse:
+        return FileResponse(path, stat_result=path.stat())
+
+    app = Starlette(
+        routes=[Route("/", endpoint=endpoint_with_zerocopysend)],
+        middleware=[Middleware(GZipMiddleware)],
+    )
+
+    scope = {
+        "type": "http",
+        "version": "3",
+        "method": "GET",
+        "path": "/",
+        "headers": [(b"accept-encoding", b"gzip"), (b"range", b"bytes=0-1999")],
+        "extensions": {"http.response.zerocopysend": {}},
+        "asgi": {"spec_version": "2.4"},
+    }
+    events: list[Message] = []
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: Message) -> None:
+        assert message["type"] != "http.response.zerocopysend"
+        events.append(message)
+
+    await app(scope, receive, send)
+
+    assert events[0]["status"] == 206
+    assert b"".join(message.get("body", b"") for message in events[1:]) == b"x" * 2000
 
 
 def test_gzip_ignored_on_range_responses(tmp_path: Path, test_client_factory: TestClientFactory) -> None:

@@ -6,6 +6,7 @@ from typing import NoReturn
 import anyio.lowlevel
 import anyio.to_thread
 
+from starlette._utils import without_zerocopysend_extension
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -100,7 +101,7 @@ class IdentityResponder:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         self.send = send
-        await self.app(scope, receive, self.send_with_compression)
+        await self.app(without_zerocopysend_extension(scope), receive, self.send_with_compression)
 
     async def send_with_compression(self, message: Message) -> None:
         message_type = message["type"]

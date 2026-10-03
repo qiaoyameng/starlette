@@ -2,6 +2,12 @@
 toc_depth: 2
 ---
 
+## Unreleased
+
+#### Added
+
+* Support ASGI `http.response.zerocopysend` for `FileResponse` file ranges, with normal chunked responses when the extension is unavailable.
+
 ## 1.7.0 (September 23, 2026)
 
 This release adds experimental OpenTelemetry tracing and requires AnyIO 4.

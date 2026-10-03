@@ -413,6 +413,362 @@ async def test_file_response_with_pathsend(tmpdir: Path) -> None:
     )
 
 
+class _TestAsyncFile:
+    def __init__(self, path: str | os.PathLike[str]) -> None:
+        self._file = open(path, "rb")
+        self.closed = False
+
+    @property
+    def wrapped(self) -> Any:
+        return self._file
+
+    async def read(self, size: int) -> bytes:
+        return self._file.read(size)
+
+    async def seek(self, offset: int) -> int:
+        return self._file.seek(offset)
+
+    async def aclose(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self._file.close()
+
+
+@pytest.fixture
+def sync_file_opener(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    opened_files: list[Any] = []
+
+    async def open_file(path: str | os.PathLike[str], mode: Literal["rb"]) -> Any:
+        assert mode == "rb"
+        file = _TestAsyncFile(path)
+        opened_files.append(file)
+        return file
+
+    monkeypatch.setattr(anyio, "open_file", open_file)
+    return opened_files
+
+
+async def _collect_file_response(
+    path: Path,
+    headers: list[tuple[bytes, bytes]],
+    extensions: dict[str, dict[Any, Any]],
+    opened_files: list[Any],
+) -> list[Message]:
+    messages: list[Message] = []
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def collect_send(message: Message) -> None:
+        if message["type"] == "http.response.zerocopysend":
+            sent_file = message["file"]
+            assert sent_file in {opened_file.wrapped for opened_file in opened_files}
+            assert not sent_file.closed
+            assert set(message) == {"type", "file", "offset", "count", "more_body"}
+            previous_offset = sent_file.tell()
+            sent_file.seek(message["offset"])
+            body = sent_file.read(message["count"])
+            sent_file.seek(previous_offset)
+            message = {
+                **message,
+                "body": body,
+            }
+        messages.append(message)
+
+    response = FileResponse(path, stat_result=path.stat())
+    await response(
+        {
+            "type": "http",
+            "method": "get",
+            "headers": headers,
+            "extensions": extensions,
+            "asgi": {"spec_version": "2.4"},
+        },
+        receive,
+        collect_send,
+    )
+
+    return messages
+
+
+def _replay_response_body(messages: list[Message]) -> tuple[int, list[tuple[bytes, bytes]], bytes]:
+    start_message, *body_messages = messages
+    headers = list(start_message["headers"])
+    body = b"".join(message["body"] for message in body_messages)
+    content_type = dict(headers).get(b"content-type", b"")
+    if content_type.startswith(b"multipart/byteranges; boundary="):
+        boundary = content_type.split(b"boundary=", 1)[1]
+        body = body.replace(b"--" + boundary, b"--BOUNDARY")
+        headers = [
+            (
+                key,
+                b"multipart/byteranges; boundary=BOUNDARY" if key == b"content-type" else value,
+            )
+            for key, value in headers
+        ]
+    return (
+        start_message["status"],
+        headers,
+        body,
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "range_header",
+    [
+        None,
+        b"bytes=50-149",
+        b"bytes=50-149,250-349",
+        b"bytes=0-999999",
+        b"bytes=-75",
+    ],
+)
+async def test_file_response_zerocopysend_matches_chunked_response(
+    tmp_path: Path, range_header: bytes | None, sync_file_opener: list[Any]
+) -> None:
+    path = tmp_path / "file.bin"
+    path.write_bytes(bytes(index % 251 for index in range(500)))
+    headers = [] if range_header is None else [(b"range", range_header)]
+
+    chunked_messages = await _collect_file_response(path, headers, {}, sync_file_opener)
+    chunked_file_count = len(sync_file_opener)
+    chunked_file_closed = sync_file_opener[0].closed
+    sync_file_opener.clear()
+    zerocopy_messages = await _collect_file_response(
+        path, headers, {"http.response.zerocopysend": {}}, sync_file_opener
+    )
+
+    assert _replay_response_body(chunked_messages) == _replay_response_body(zerocopy_messages)
+    assert chunked_file_count == len(sync_file_opener) == 1
+    assert chunked_file_closed
+    assert sync_file_opener[0].closed
+
+    zerocopy_sends = [
+        message for message in zerocopy_messages if message["type"] == "http.response.zerocopysend"
+    ]
+    assert zerocopy_sends
+    assert all(message["file"] is sync_file_opener[0].wrapped for message in zerocopy_sends)
+
+
+@pytest.mark.anyio
+async def test_file_response_zerocopysend_multipart_boundaries_remain_body_messages(
+    tmp_path: Path, sync_file_opener: list[Any]
+) -> None:
+    path = tmp_path / "file.bin"
+    path.write_bytes(bytes(range(256)))
+
+    messages = await _collect_file_response(
+        path,
+        [(b"range", b"bytes=10-19,100-109")],
+        {"http.response.zerocopysend": {}},
+        sync_file_opener,
+    )
+
+    assert messages[0]["status"] == 206
+    assert messages[1]["type"] == "http.response.body"
+    assert messages[2].pop("body") == bytes(range(10, 20))
+    assert messages[2] == {
+        "type": "http.response.zerocopysend",
+        "file": sync_file_opener[0].wrapped,
+        "offset": 10,
+        "count": 10,
+        "more_body": True,
+    }
+    assert messages[3] == {"type": "http.response.body", "body": b"\r\n", "more_body": True}
+    assert messages[4]["type"] == "http.response.body"
+    assert messages[5].pop("body") == bytes(range(100, 110))
+    assert messages[5] == {
+        "type": "http.response.zerocopysend",
+        "file": sync_file_opener[0].wrapped,
+        "offset": 100,
+        "count": 10,
+        "more_body": True,
+    }
+    assert messages[6] == {"type": "http.response.body", "body": b"\r\n", "more_body": True}
+    assert messages[7]["type"] == "http.response.body"
+    assert messages[7]["more_body"] is False
+
+
+@pytest.mark.anyio
+async def test_file_response_zerocopysend_head_has_no_file_message(
+    tmp_path: Path, sync_file_opener: list[Any]
+) -> None:
+    path = tmp_path / "file.bin"
+    path.write_bytes(b"file content")
+    messages: list[Message] = []
+
+    async def receive() -> Message:  # type: ignore[empty-body]
+        ...  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        assert message["type"] != "http.response.zerocopysend"
+        messages.append(message)
+
+    await FileResponse(path, stat_result=path.stat())(
+        {
+            "type": "http",
+            "method": "head",
+            "headers": [(b"range", b"bytes=0-3")],
+            "extensions": {"http.response.zerocopysend": {}},
+        },
+        receive,
+        send,
+    )
+
+    assert messages[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+
+
+@pytest.mark.anyio
+async def test_file_response_pathsend_takes_precedence_over_zerocopysend(
+    tmp_path: Path, sync_file_opener: list[Any]
+) -> None:
+    path = tmp_path / "file.bin"
+    path.write_bytes(b"file content")
+    messages: list[Message] = []
+
+    async def receive() -> Message:  # type: ignore[empty-body]
+        ...  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+
+    await FileResponse(path, stat_result=path.stat())(
+        {
+            "type": "http",
+            "method": "get",
+            "headers": [],
+            "extensions": {
+                "http.response.pathsend": {},
+                "http.response.zerocopysend": {},
+            },
+            "asgi": {"spec_version": "2.4"},
+        },
+        receive,
+        send,
+    )
+
+    assert messages[1] == {"type": "http.response.pathsend", "path": str(path)}
+
+
+@pytest.mark.anyio
+async def test_file_response_zerocopysend_range_uses_pathsend_for_full_file_only(
+    tmp_path: Path, sync_file_opener: list[Any]
+) -> None:
+    path = tmp_path / "file.bin"
+    path.write_bytes(b"file content")
+    messages: list[Message] = []
+
+    async def receive() -> Message:  # type: ignore[empty-body]
+        ...  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+
+    await FileResponse(path, stat_result=path.stat())(
+        {
+            "type": "http",
+            "method": "get",
+            "headers": [(b"range", b"bytes=0-3")],
+            "extensions": {
+                "http.response.pathsend": {},
+                "http.response.zerocopysend": {},
+            },
+            "asgi": {"spec_version": "2.4"},
+        },
+        receive,
+        send,
+    )
+
+    assert messages[1]["type"] == "http.response.zerocopysend"
+    assert messages[1]["offset"] == 0
+    assert messages[1]["count"] == 4
+
+
+@pytest.mark.anyio
+async def test_file_response_zerocopysend_background_runs_after_file_closes(
+    tmp_path: Path, sync_file_opener: list[Any]
+) -> None:
+    path = tmp_path / "file.bin"
+    path.write_bytes(b"file content")
+    files = sync_file_opener
+    background_checked = False
+
+    async def receive() -> Message:  # type: ignore[empty-body]
+        ...  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.zerocopysend":
+            assert not message["file"].closed
+
+    async def background() -> None:
+        nonlocal background_checked
+        assert files[0].closed
+        background_checked = True
+
+    await FileResponse(path, stat_result=path.stat(), background=BackgroundTask(background))(
+        {
+            "type": "http",
+            "method": "get",
+            "headers": [],
+            "extensions": {"http.response.zerocopysend": {}},
+            "asgi": {"spec_version": "2.4"},
+        },
+        receive,
+        send,
+    )
+
+    assert background_checked
+
+
+@pytest.mark.anyio
+async def test_file_response_zerocopysend_client_disconnect_closes_file_before_background(
+    tmp_path: Path, sync_file_opener: list[Any]
+) -> None:
+    path = tmp_path / "file.bin"
+    path.write_bytes(b"file content")
+    files = sync_file_opener
+    send_started = anyio.Event()
+    background_ran = False
+    received_request = False
+
+    async def receive() -> Message:
+        nonlocal received_request
+        if not received_request:
+            received_request = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await send_started.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.zerocopysend":
+            assert not message["file"].closed
+            send_started.set()
+            await anyio.sleep_forever()
+
+    async def background() -> None:
+        nonlocal background_ran
+        assert files[0].closed
+        background_ran = True
+
+    with anyio.fail_after(5):
+        await FileResponse(path, stat_result=path.stat(), background=BackgroundTask(background))(
+            {
+                "type": "http",
+                "method": "get",
+                "headers": [],
+                "extensions": {"http.response.zerocopysend": {}},
+                "asgi": {"spec_version": "2.3"},
+            },
+            receive,
+            send,
+        )
+
+    assert send_started.is_set()
+    assert files[0].closed
+    assert background_ran
+
+
 @pytest.fixture
 def file_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, list[anyio.AsyncFile[bytes]]]:
     path = tmp_path / "file.bin"
@@ -435,7 +791,11 @@ def scope(request: pytest.FixtureRequest) -> Scope:
         "type": "http",
         "method": "GET",
         "headers": [] if request.param is None else [(b"range", request.param)],
-        "extensions": {"http.response.pathsend": {}} if request.param is not None else {},
+        "extensions": (
+            {"http.response.pathsend": {}, "http.response.zerocopysend": {}}
+            if request.param is not None
+            else {}
+        ),
     }
 
 
@@ -462,7 +822,12 @@ async def test_file_response_stops_on_disconnect(
 
     async def send(message: Message) -> None:
         nonlocal submitted
-        if message["type"] == "http.response.body":
+        if message["type"] == "http.response.zerocopysend":
+            submitted += message["count"]
+            if submitted >= FileResponse.chunk_size:
+                disconnected.set()
+                await anyio.sleep_forever()
+        elif message["type"] == "http.response.body":
             submitted += len(message["body"])
             if submitted >= FileResponse.chunk_size:
                 disconnected.set()
@@ -495,7 +860,7 @@ async def test_file_response_closes_on_cancellation(
         pytest.fail("The disconnect listener should be cancelled")  # pragma: no cover - sleep never returns
 
     async def send(message: Message) -> None:
-        if message["type"] == "http.response.body":
+        if message["type"] in {"http.response.body", "http.response.zerocopysend"}:
             cancel_scope.cancel()
             await anyio.sleep_forever()
 
@@ -527,7 +892,7 @@ async def test_file_response_closes_on_send_error(
         pytest.fail("The disconnect listener should be cancelled")  # pragma: no cover - sleep never returns
 
     async def send(message: Message) -> None:
-        if message["type"] == "http.response.body":
+        if message["type"] in {"http.response.body", "http.response.zerocopysend"}:
             raise error
 
     with anyio.fail_after(5), pytest.raises(OSError) as exc:

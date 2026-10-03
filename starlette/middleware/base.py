@@ -5,7 +5,7 @@ from typing import Any, TypeVar
 
 import anyio
 
-from starlette._utils import create_collapsing_task_group
+from starlette._utils import create_collapsing_task_group, without_zerocopysend_extension
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -103,7 +103,8 @@ class BaseHTTPMiddleware:
             await self.app(scope, receive, send)
             return
 
-        request = _CachedRequest(scope, receive)
+        app_scope = without_zerocopysend_extension(scope)
+        request = _CachedRequest(app_scope, receive)
         wrapped_receive = request.wrapped_receive
         response_sent = anyio.Event()
         app_exc: Exception | None = None
@@ -146,7 +147,7 @@ class BaseHTTPMiddleware:
 
                 with send_stream:
                     try:
-                        await self.app(scope, receive_or_disconnect, send_no_error)
+                        await self.app(app_scope, receive_or_disconnect, send_no_error)
                     except Exception as exc:
                         app_exc = exc
 

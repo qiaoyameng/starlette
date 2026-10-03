@@ -345,6 +345,7 @@ class FileResponse(Response):
         scope_type = scope["type"]
         send_header_only = scope_type == "http" and scope["method"].upper() == "HEAD"
         send_pathsend = scope_type == "http" and "http.response.pathsend" in scope.get("extensions", {})
+        send_zerocopysend = scope_type == "http" and "http.response.zerocopysend" in scope.get("extensions", {})
         if scope_type == "websocket":
             send = self._wrap_websocket_denial_send(send)
 
@@ -370,7 +371,14 @@ class FileResponse(Response):
             or http_range is None
             or (http_if_range is not None and not self._should_use_range(http_if_range))
         ):
-            send_file = partial(self._handle_simple, send, send_header_only, send_pathsend)
+            send_file = partial(
+                self._handle_simple,
+                send,
+                send_header_only,
+                send_pathsend,
+                send_zerocopysend,
+                stat_result.st_size,
+            )
         else:
             try:
                 ranges = self._parse_range_header(http_range, stat_result.st_size)
@@ -381,17 +389,44 @@ class FileResponse(Response):
                 return await response(scope, receive, send)
 
             if len(ranges) == 0:
-                send_file = partial(self._handle_simple, send, send_header_only, send_pathsend)
+                send_file = partial(
+                    self._handle_simple,
+                    send,
+                    send_header_only,
+                    send_pathsend,
+                    send_zerocopysend,
+                    stat_result.st_size,
+                )
             elif len(ranges) == 1:
                 start, end = ranges[0]
-                send_file = partial(self._handle_single_range, send, start, end, stat_result.st_size, send_header_only)
+                send_file = partial(
+                    self._handle_single_range,
+                    send,
+                    start,
+                    end,
+                    stat_result.st_size,
+                    send_header_only,
+                    send_zerocopysend,
+                )
                 send_pathsend = False
             else:
-                send_file = partial(self._handle_multiple_ranges, send, ranges, stat_result.st_size, send_header_only)
+                send_file = partial(
+                    self._handle_multiple_ranges,
+                    send,
+                    ranges,
+                    stat_result.st_size,
+                    send_header_only,
+                    send_zerocopysend,
+                )
                 send_pathsend = False
 
         spec_version = tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split(".")))
-        if scope_type != "http" or send_header_only or send_pathsend or spec_version >= (2, 4):
+        if (
+            scope_type != "http"
+            or send_header_only
+            or send_pathsend
+            or spec_version >= (2, 4)
+        ):
             await send_file()
         else:
             async with create_collapsing_task_group() as task_group:
@@ -420,12 +455,30 @@ class FileResponse(Response):
             with anyio.CancelScope(shield=True):
                 await file.aclose()
 
-    async def _handle_simple(self, send: Send, send_header_only: bool, send_pathsend: bool) -> None:
+    async def _handle_simple(
+        self,
+        send: Send,
+        send_header_only: bool,
+        send_pathsend: bool,
+        send_zerocopysend: bool,
+        file_size: int,
+    ) -> None:
         await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
         if send_header_only:
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         elif send_pathsend:
             await send({"type": "http.response.pathsend", "path": str(self.path)})
+        elif send_zerocopysend:
+            async with self._open_file() as file:
+                await send(
+                    {
+                        "type": "http.response.zerocopysend",
+                        "file": file.wrapped,
+                        "offset": 0,
+                        "count": file_size,
+                        "more_body": False,
+                    }
+                )
         else:
             async with self._open_file() as file:
                 more_body = True
@@ -435,7 +488,13 @@ class FileResponse(Response):
                     await send({"type": "http.response.body", "body": chunk, "more_body": more_body})
 
     async def _handle_single_range(
-        self, send: Send, start: int, end: int, file_size: int, send_header_only: bool
+        self,
+        send: Send,
+        start: int,
+        end: int,
+        file_size: int,
+        send_header_only: bool,
+        send_zerocopysend: bool,
     ) -> None:
         headers = MutableHeaders(raw=list(self.raw_headers))
         headers["content-range"] = f"bytes {start}-{end - 1}/{file_size}"
@@ -443,6 +502,17 @@ class FileResponse(Response):
         await send({"type": "http.response.start", "status": 206, "headers": headers.raw})
         if send_header_only:
             await send({"type": "http.response.body", "body": b"", "more_body": False})
+        elif send_zerocopysend:
+            async with self._open_file() as file:
+                await send(
+                    {
+                        "type": "http.response.zerocopysend",
+                        "file": file.wrapped,
+                        "offset": start,
+                        "count": end - start,
+                        "more_body": False,
+                    }
+                )
         else:
             async with self._open_file() as file:
                 await file.seek(start)
@@ -459,6 +529,7 @@ class FileResponse(Response):
         ranges: list[tuple[int, int]],
         file_size: int,
         send_header_only: bool,
+        send_zerocopysend: bool,
     ) -> None:
         # In firefox and chrome, they use boundary with 95-96 bits entropy (that's roughly 13 bytes).
         boundary = token_hex(13)
@@ -475,13 +546,24 @@ class FileResponse(Response):
             async with self._open_file() as file:
                 for start, end in ranges:
                     await send({"type": "http.response.body", "body": header_generator(start, end), "more_body": True})
-                    await file.seek(start)
-                    while start < end:
-                        chunk = await file.read(min(self.chunk_size, end - start))
-                        if not chunk:
-                            raise RuntimeError(f"File at path {self.path} is shorter than expected.")
-                        start += len(chunk)
-                        await send({"type": "http.response.body", "body": chunk, "more_body": True})
+                    if send_zerocopysend:
+                        await send(
+                            {
+                                "type": "http.response.zerocopysend",
+                                "file": file.wrapped,
+                                "offset": start,
+                                "count": end - start,
+                                "more_body": True,
+                            }
+                        )
+                    else:
+                        await file.seek(start)
+                        while start < end:
+                            chunk = await file.read(min(self.chunk_size, end - start))
+                            if not chunk:
+                                raise RuntimeError(f"File at path {self.path} is shorter than expected.")
+                            start += len(chunk)
+                            await send({"type": "http.response.body", "body": chunk, "more_body": True})
                     await send({"type": "http.response.body", "body": b"\r\n", "more_body": True})
                 await send(
                     {

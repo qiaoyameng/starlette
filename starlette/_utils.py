@@ -150,3 +150,15 @@ def get_route_path(scope: Scope) -> str:
         return path[len(root_path) :]
 
     return path
+
+
+def without_zerocopysend_extension(scope: Scope) -> Scope:
+    extensions = scope.get("extensions", {})
+    if "http.response.zerocopysend" not in extensions:
+        return scope
+    return {
+        **scope,
+        "extensions": {
+            key: value for key, value in extensions.items() if key != "http.response.zerocopysend"
+        },
+    }

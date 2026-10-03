@@ -1255,6 +1255,66 @@ async def test_asgi_pathsend_events(tmpdir: Path) -> None:
     assert events[1]["type"] == "http.response.pathsend"
 
 
+@pytest.mark.anyio
+async def test_asgi_zerocopysend_falls_back_to_body_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "example.txt"
+    path.write_bytes(b"<file content>")
+
+    class FakeAsyncFile:
+        def __init__(self, path: str) -> None:
+            self.file = open(path, "rb")
+
+        async def read(self, size: int) -> bytes:
+            return self.file.read(size)
+
+        async def seek(self, offset: int) -> int:
+            return self.file.seek(offset)
+
+        async def aclose(self) -> None:
+            self.file.close()
+
+    async def open_file(path: str, mode: str) -> FakeAsyncFile:
+        assert mode == "rb"
+        return FakeAsyncFile(path)
+
+    monkeypatch.setattr(anyio, "open_file", open_file)
+
+    async def endpoint_with_zerocopysend(_: Request) -> FileResponse:
+        return FileResponse(path, stat_result=path.stat())
+
+    async def passthrough(request: Request, call_next: RequestResponseEndpoint) -> Response:
+        return await call_next(request)
+
+    app = Starlette(
+        middleware=[Middleware(BaseHTTPMiddleware, dispatch=passthrough)],
+        routes=[Route("/", endpoint_with_zerocopysend)],
+    )
+
+    scope = {
+        "type": "http",
+        "version": "3",
+        "method": "GET",
+        "path": "/",
+        "headers": [(b"range", b"bytes=1-12")],
+        "extensions": {"http.response.zerocopysend": {}},
+    }
+    events: list[Message] = []
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: Message) -> None:
+        assert message["type"] != "http.response.zerocopysend"
+        events.append(message)
+
+    await app(scope, receive, send)
+
+    assert events[0]["status"] == 206
+    assert b"".join(message.get("body", b"") for message in events[1:]) == b"file content"
+
+
 def test_error_context_propagation(test_client_factory: TestClientFactory) -> None:
     class PassthroughMiddleware(BaseHTTPMiddleware):
         async def dispatch(
