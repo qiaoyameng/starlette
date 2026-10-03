@@ -232,6 +232,8 @@ class StreamingResponse(Response):
         headers: Mapping[str, str] | None = None,
         media_type: str | None = None,
         background: BackgroundTask | None = None,
+        max_buffer_size: int | None = None,
+        max_buffer_wait: float | None = None,
     ) -> None:
         if isinstance(content, AsyncIterable):
             self.body_iterator = content
@@ -240,6 +242,12 @@ class StreamingResponse(Response):
         self.status_code = status_code
         self.media_type = self.media_type if media_type is None else media_type
         self.background = background
+        if max_buffer_size is not None and max_buffer_size < 0:
+            raise ValueError("max_buffer_size must be non-negative")
+        if max_buffer_wait is not None and max_buffer_wait < 0:
+            raise ValueError("max_buffer_wait must be non-negative")
+        self.max_buffer_size = max_buffer_size
+        self.max_buffer_wait = max_buffer_wait
         self.init_headers(headers)
 
     async def listen_for_disconnect(self, receive: Receive) -> None:
@@ -248,14 +256,104 @@ class StreamingResponse(Response):
             if message["type"] == "http.disconnect":
                 break
 
+    async def _send_chunk(self, send: Send, chunks: list[bytes | memoryview]) -> None:
+        # A single buffered chunk is forwarded as-is instead of copying it into a
+        # joined buffer; only multiple chunks are concatenated.
+        body = chunks[0] if len(chunks) == 1 else b"".join(chunks)
+        await send({"type": "http.response.body", "body": body, "more_body": True})
+
     async def stream_response(self, send: Send) -> None:
         await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
-        async for chunk in self.body_iterator:
-            if not isinstance(chunk, bytes | memoryview):
-                chunk = chunk.encode(self.charset)
-            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        if self.max_buffer_size is None and self.max_buffer_wait is None:
+            async for chunk in self.body_iterator:
+                if not isinstance(chunk, bytes | memoryview):
+                    chunk = chunk.encode(self.charset)
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        else:
+            await self._stream_coalesced(send)
 
         await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    async def _stream_coalesced(self, send: Send) -> None:
+        # The producer hands chunks to the consumer through a zero-capacity memory
+        # stream. Sends rendezvous with receives, so when `send` blocks the consumer
+        # the producer blocks too: there is no unbounded read-ahead queue.
+        max_buffer_size = self.max_buffer_size
+        max_buffer_wait = self.max_buffer_wait
+
+        async def produce(send_stream: anyio.abc.ObjectSendStream[bytes | memoryview]) -> None:
+            async with send_stream:
+                async for chunk in self.body_iterator:
+                    if not isinstance(chunk, bytes | memoryview):
+                        chunk = chunk.encode(self.charset)
+                    # Empty chunks neither add data nor restart the wait timer.
+                    if not chunk:
+                        continue
+                    await send_stream.send(chunk)
+
+        buffered: list[bytes | memoryview] = []
+        buffered_size = 0
+        deadline: float | None = None
+        async with create_collapsing_task_group() as task_group:
+            send_stream, receive_stream = anyio.create_memory_object_stream[bytes | memoryview](0)
+            task_group.start_soon(produce, send_stream)
+            async with receive_stream:
+                while True:
+                    # The wait restarts whenever new data is buffered, so a burst of
+                    # small chunks coalesces for up to max_buffer_wait after the most
+                    # recent data. Empty chunks are dropped by the producer and never
+                    # reach here, so they cannot keep postponing the deadline.
+                    if max_buffer_wait is not None and deadline is not None:
+                        cancel_scope = anyio.CancelScope(deadline=deadline)
+                    else:
+                        cancel_scope = None
+                    chunk: bytes | memoryview | None = None
+                    try:
+                        if cancel_scope is not None:
+                            with cancel_scope:
+                                chunk = await receive_stream.receive()
+                        else:
+                            chunk = await receive_stream.receive()
+                    except anyio.EndOfStream:
+                        break
+
+                    # A timeout with no delivered chunk flushes what is held.
+                    # Rendezvous guarantees that a chunk handed over in the same
+                    # round is either parked in the stream or returned in `chunk`,
+                    # so it is never lost here.
+                    if chunk is None:
+                        await self._send_chunk(send, buffered)
+                        buffered = []
+                        buffered_size = 0
+                        deadline = None
+                        continue
+
+                    # A single chunk already at or above the size bound must not be
+                    # copied into a full-width buffer. If smaller chunks are still
+                    # held, flush those first, then forward the big chunk on its own.
+                    if max_buffer_size is not None and len(chunk) >= max_buffer_size:
+                        if buffered:
+                            await self._send_chunk(send, buffered)
+                            buffered = []
+                            buffered_size = 0
+                        deadline = None
+                        await self._send_chunk(send, [chunk])
+                    else:
+                        if max_buffer_wait is not None:
+                            # Fresh data extends the wait, coalescing a continuous
+                            # burst; empty chunks never arrive here.
+                            deadline = anyio.current_time() + max_buffer_wait
+                        buffered.append(chunk)
+                        buffered_size += len(chunk)
+                        if max_buffer_size is not None and buffered_size >= max_buffer_size:
+                            await self._send_chunk(send, buffered)
+                            buffered = []
+                            buffered_size = 0
+                            deadline = None
+
+        # End of body: flush whatever was still held back.
+        if buffered:
+            await self._send_chunk(send, buffered)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "websocket":

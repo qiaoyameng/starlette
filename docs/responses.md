@@ -177,6 +177,44 @@ async def app(scope, receive, send):
 
 Have in mind that <a href="https://docs.python.org/3/glossary.html#term-file-like-object" target="_blank">file-like</a> objects (like those created by `open()`) are normal iterators. So, you can return them directly in a `StreamingResponse`.
 
+#### Buffering small chunks
+
+Async generators sometimes yield only a few bytes at a time, and sending each
+piece immediately produces many tiny writes. `StreamingResponse` can merge those
+pieces by passing `max_buffer_size` (the most bytes to hold) and
+`max_buffer_wait` (the longest time, in seconds, to wait for more data). The
+pending buffer is sent as soon as either limit is reached, and a final empty
+chunk marks the end of the body. Both arguments are optional and default to
+`None`, which keeps the original behavior of sending every chunk immediately.
+
+Each non-empty chunk that arrives while data is buffered restarts the wait, so
+a continuous burst of small chunks is coalesced for up to `max_buffer_wait`
+after the most recent piece; empty chunks produced by the generator are ignored
+and never postpone the deadline.
+
+When the underlying `send` blocks, the producer is paused too, so data is never
+read ahead into an unbounded queue: at most one chunk can be waiting to be
+buffered. A single chunk that is already at least `max_buffer_size` is forwarded
+on its own instead of being copied into a full-width buffer. If the client
+disconnects or the generator raises, any unsent buffer is discarded, no tail
+chunk is sent, and the pending wait is cancelled; generator errors propagate to
+the caller.
+
+```python
+from starlette.responses import StreamingResponse
+
+
+async def events():
+    for message in event_source():
+        yield message
+
+
+async def app(scope, receive, send):
+    # Send once at least 4 KiB has accumulated or 100 ms has elapsed.
+    response = StreamingResponse(events(), max_buffer_size=4096, max_buffer_wait=0.1)
+    await response(scope, receive, send)
+```
+
 ### FileResponse
 
 Asynchronously streams a file as the response.

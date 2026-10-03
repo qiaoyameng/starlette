@@ -2,6 +2,12 @@
 toc_depth: 2
 ---
 
+## Unreleased
+
+#### Added
+
+* Add `max_buffer_size` and `max_buffer_wait` parameters to `StreamingResponse` to coalesce many small chunks, with natural backpressure, single-chunk zero-copy forwarding, and no timer reset on empty chunks.
+
 ## 1.7.0 (September 23, 2026)
 
 This release adds experimental OpenTelemetry tracing and requires AnyIO 4.

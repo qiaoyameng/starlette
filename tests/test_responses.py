@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
+import heapq
 import os
 import re
 import sys
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -854,6 +856,301 @@ async def test_streaming_response_runs_background_on_websocket_scope() -> None:
         "websocket.http.response.body",
         "websocket.http.response.body",
     ]
+
+
+class _TimeTravelLoop(asyncio.SelectorEventLoop):
+    """An asyncio loop whose clock only advances to the next scheduled timer.
+
+    The virtual clock is stored outside the loop instance to avoid clashing with
+    attributes AnyIO attaches to the loop. When nothing else is runnable, the loop
+    jumps straight to the earliest due timer, so waiting behavior is deterministic
+    and takes no real time.
+    """
+
+    def time(self) -> float:
+        return _virtual_clock.get(id(self), 0.0)
+
+    def _run_once(self) -> None:
+        current = _virtual_clock.get(id(self), 0.0)
+        if not self._ready:
+            while self._scheduled and self._scheduled[0].cancelled():
+                heapq.heappop(self._scheduled)
+            if self._scheduled:
+                when = self._scheduled[0].when
+                current = max(current, when() if callable(when) else when)
+                _virtual_clock[id(self)] = current
+        super()._run_once()
+
+
+_virtual_clock: dict[int, float] = {}
+
+
+def run_on_time_travel_loop(async_fn: Callable[[], Awaitable[None]]) -> None:
+    """Run a coroutine on the fake-clock asyncio loop."""
+    _virtual_clock.clear()
+    anyio.run(
+        async_fn,
+        backend="asyncio",
+        backend_options={"loop_factory": _TimeTravelLoop},
+    )
+
+
+class RecordingSend:
+    """Controlled ASGI send that records the time and size of every body write."""
+
+    def __init__(self, block: float = 0.0) -> None:
+        self.records: list[tuple[float, bytes, bool | None]] = []
+        self.block = block
+
+    async def __call__(self, message: Message) -> None:
+        if message["type"] == "http.response.body":
+            loop = asyncio.get_running_loop()
+            self.records.append(
+                (round(loop.time(), 3), bytes(message.get("body") or b""), message.get("more_body"))
+            )
+            if self.block:
+                await anyio.sleep(self.block)
+
+    @property
+    def bodies(self) -> list[tuple[float, bytes]]:
+        return [(when, body) for when, body, _ in self.records if body]
+
+
+async def _no_disconnect() -> Message:
+    return {"type": "http.request"}
+
+
+_HTTP_SCOPE: Scope = {"type": "http", "asgi": {"spec_version": "2.4"}}
+
+
+def test_streaming_response_coalesces_by_size_and_wait() -> None:
+    async def scenario() -> None:
+        clock = asyncio.get_running_loop()
+        recording_send = RecordingSend()
+
+        async def content() -> AsyncIterator[bytes]:
+            yield b"a"
+            yield b"b"
+            yield b"c"  # fills up to the 3-byte bound
+            await anyio.sleep(2.0)
+            yield b"d"  # lone block; the generator stays open, so the wait fires
+            await anyio.sleep(2.0)
+
+        response = StreamingResponse(content(), max_buffer_size=3, max_buffer_wait=1.0)
+        await response(_HTTP_SCOPE, _no_disconnect, recording_send)
+
+        assert recording_send.bodies == [(0.0, b"abc"), (3.0, b"d")]
+        assert clock.time() == 4.0
+        assert recording_send.records[-1] == (4.0, b"", False)
+
+    run_on_time_travel_loop(scenario)
+
+
+def test_streaming_response_wait_flushes_when_producer_pauses() -> None:
+    async def scenario() -> None:
+        recording_send = RecordingSend()
+
+        async def content() -> AsyncIterator[bytes]:
+            # Three small chunks arrive back to back without reaching the size bound.
+            yield b"a"
+            yield b"b"
+            yield b"c"
+            # The producer then pauses for longer than the wait, which triggers a
+            # flush, before producing one more chunk and closing.
+            await anyio.sleep(2.0)
+            yield b"d"
+
+        response = StreamingResponse(content(), max_buffer_size=1024, max_buffer_wait=1.0)
+        await response(_HTTP_SCOPE, _no_disconnect, recording_send)
+
+        assert recording_send.bodies == [(1.0, b"abc"), (2.0, b"d")]
+
+    run_on_time_travel_loop(scenario)
+
+
+def test_streaming_response_empty_chunks_do_not_reset_wait() -> None:
+    async def scenario() -> None:
+        recording_send = RecordingSend()
+
+        async def content() -> AsyncIterator[bytes]:
+            yield b"x"
+            await anyio.sleep(0.4)
+            yield b""
+            await anyio.sleep(0.4)
+            yield b""
+            await anyio.sleep(3.0)
+
+        response = StreamingResponse(content(), max_buffer_size=1024, max_buffer_wait=1.0)
+        await response(_HTTP_SCOPE, _no_disconnect, recording_send)
+
+        # The deadline stays anchored at t=0 despite empty yields; flush at t=1.
+        assert recording_send.bodies == [(1.0, b"x")]
+
+    run_on_time_travel_loop(scenario)
+
+
+def test_streaming_response_wait_restarts_on_fresh_data() -> None:
+    async def scenario() -> None:
+        recording_send = RecordingSend()
+
+        async def content() -> AsyncIterator[bytes]:
+            yield b"a"
+            await anyio.sleep(0.4)
+            yield b"b"  # fresh data within the window restarts the wait
+            await anyio.sleep(0.4)
+            yield b"c"  # fresh data restarts the wait again
+            await anyio.sleep(3.0)
+
+        response = StreamingResponse(content(), max_buffer_size=1024, max_buffer_wait=1.0)
+        await response(_HTTP_SCOPE, _no_disconnect, recording_send)
+
+        # The last data arrives at t=0.8, so the coalesced flush happens at t=1.8.
+        assert recording_send.bodies == [(1.8, b"abc")]
+
+    run_on_time_travel_loop(scenario)
+
+
+def test_streaming_response_large_chunk_is_forwarded_without_copy() -> None:
+    async def scenario() -> None:
+        sent: list[bytes] = []
+
+        async def send(message: Message) -> None:
+            if message["type"] == "http.response.body":
+                sent.append(message.get("body"))
+
+        large = bytes(100)
+
+        async def content() -> AsyncIterator[bytes]:
+            yield b"ab"  # smaller chunks stay buffered
+            yield large  # at/above the bound: drain the buffer, send large as-is
+            yield b"z"
+
+        response = StreamingResponse(content(), max_buffer_size=10)
+        await response(_HTTP_SCOPE, _no_disconnect, send)
+
+        assert sent[0] == b"ab"
+        assert sent[1] is large  # forwarded by identity, never copied into a join
+        assert sent[2] == b"z"
+
+    run_on_time_travel_loop(scenario)
+
+
+def test_streaming_response_backpressure_without_readahead() -> None:
+    async def scenario() -> None:
+        produced = 0
+        sent_bytes = 0
+        max_inflight = 0
+        recording_send = RecordingSend(block=1.0)
+
+        async def send(message: Message) -> None:
+            nonlocal sent_bytes, max_inflight
+            await recording_send(message)
+            if message["type"] == "http.response.body" and message.get("body"):
+                max_inflight = max(max_inflight, produced - sent_bytes)
+                sent_bytes += len(message["body"])
+
+        async def content() -> AsyncIterator[bytes]:
+            nonlocal produced
+            for _ in range(50):
+                yield b"x"
+                produced += 1
+
+        response = StreamingResponse(content(), max_buffer_size=1)
+        await response(_HTTP_SCOPE, _no_disconnect, send)
+
+        assert produced == 50
+        assert sent_bytes == 50
+        # A zero-capacity rendezvous limits read-ahead to at most one chunk.
+        assert max_inflight == 1, max_inflight
+        assert len(recording_send.bodies) == 50
+
+    run_on_time_travel_loop(scenario)
+
+
+def test_streaming_response_generator_failure_drops_buffer_and_timers() -> None:
+    async def scenario() -> None:
+        recording_send = RecordingSend()
+
+        async def content() -> AsyncIterator[bytes]:
+            yield b"a"
+            yield b"b"
+            await anyio.sleep(0.5)
+            raise RuntimeError("boom")
+
+        response = StreamingResponse(content(), max_buffer_size=10, max_buffer_wait=10.0)
+        with pytest.raises(RuntimeError, match="boom"):
+            await response(_HTTP_SCOPE, _no_disconnect, recording_send)
+
+        # The pending buffer is neither sent nor followed by a tail chunk.
+        assert recording_send.bodies == []
+        assert recording_send.records == []
+        # No wait timer is left scheduled.
+        loop = asyncio.get_running_loop()
+        assert all(handle.cancelled() for handle in loop._scheduled)
+
+    run_on_time_travel_loop(scenario)
+
+
+def test_streaming_response_disconnect_stops_coalescing() -> None:
+    async def scenario() -> None:
+        disconnected = anyio.Event()
+        streamed = 0
+
+        async def receive() -> Message:
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message: Message) -> None:
+            nonlocal streamed
+            if message["type"] == "http.response.body" and message.get("body"):
+                streamed += len(message["body"])
+                if streamed >= 4:
+                    disconnected.set()
+
+        async def content() -> AsyncIterator[bytes]:
+            while True:
+                await asyncio.sleep(0)
+                yield b"xx"
+
+        response = StreamingResponse(content(), max_buffer_size=2, max_buffer_wait=1.0)
+        # Pre-2.4 scope: disconnect is observed by a concurrent listener task.
+        with anyio.move_on_after(10):
+            await response({"type": "http"}, receive, send)
+
+        assert streamed >= 4
+        loop = asyncio.get_running_loop()
+        assert all(handle.cancelled() for handle in loop._scheduled)
+
+    run_on_time_travel_loop(scenario)
+
+
+def test_streaming_response_default_behavior_unchanged() -> None:
+    async def scenario() -> None:
+        recording_send = RecordingSend()
+
+        async def content() -> AsyncIterator[bytes]:
+            yield b"a"
+            yield b"b"
+
+        response = StreamingResponse(content())
+        await response(_HTTP_SCOPE, _no_disconnect, recording_send)
+
+        # Each chunk goes out individually, just as without buffering options.
+        assert recording_send.bodies == [(0.0, b"a"), (0.0, b"b")]
+        assert recording_send.records[-1] == (0.0, b"", False)
+
+    run_on_time_travel_loop(scenario)
+
+
+def test_streaming_response_invalid_buffer_options() -> None:
+    async def content() -> AsyncIterator[bytes]:
+        yield b"x"
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    with pytest.raises(ValueError, match="max_buffer_size"):
+        StreamingResponse(content(), max_buffer_size=-1)
+    with pytest.raises(ValueError, match="max_buffer_wait"):
+        StreamingResponse(content(), max_buffer_wait=-0.1)
 
 
 README = """\
