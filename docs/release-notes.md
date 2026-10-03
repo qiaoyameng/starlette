@@ -2,6 +2,12 @@
 toc_depth: 2
 ---
 
+## Unreleased
+
+#### Added
+
+* Support the ASGI `http.response.zerocopysend` extension in `FileResponse`. When the server advertises the extension, file regions (including single and multipart `Range` responses) are handed to the server with an open file object, `offset`, `count`, and `more_body`, instead of being read into memory; boundary text is still sent as a regular body. Responses fall back to chunked reads when the extension is absent, `HEAD` requests send no file content, and the file stays open until the server finishes consuming it.
+
 ## 1.7.0 (September 23, 2026)
 
 This release adds experimental OpenTelemetry tracing and requires AnyIO 4.

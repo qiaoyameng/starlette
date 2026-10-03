@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextvars
+import os
 from collections.abc import AsyncGenerator, AsyncIterator, Generator
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -1253,6 +1254,80 @@ async def test_asgi_pathsend_events(tmpdir: Path) -> None:
     assert len(events) == 2
     assert events[0]["type"] == "http.response.start"
     assert events[1]["type"] == "http.response.pathsend"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "range_header",
+    [b"bytes=2-9", b"bytes=0-3, 12-15"],
+)
+async def test_asgi_zerocopysend_events(tmpdir: Path, range_header: bytes) -> None:
+    path = tmpdir / "example.txt"
+    content = b"0123456789abcdefghij"
+    with path.open("wb") as file:
+        file.write(content)
+
+    events: list[Message] = []
+
+    async def endpoint(_: Request) -> FileResponse:
+        return FileResponse(path)
+
+    async def passthrough(request: Request, call_next: RequestResponseEndpoint) -> Response:
+        return await call_next(request)
+
+    app = Starlette(
+        middleware=[Middleware(BaseHTTPMiddleware, dispatch=passthrough)],
+        routes=[Route("/", endpoint)],
+    )
+
+    scope = {
+        "type": "http",
+        "version": "3",
+        "method": "GET",
+        "path": "/",
+        "headers": [(b"range", range_header)],
+        "extensions": {"http.response.zerocopysend": {}},
+    }
+
+    sent_request = False
+
+    async def receive() -> Message:
+        nonlocal sent_request
+        if not sent_request:
+            sent_request = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        # Keep the connection open while the body is transferred.
+        await anyio.sleep_forever()
+        return {"type": "http.disconnect"}  # pragma: no cover
+
+    body = bytearray()
+
+    async def send(message: Message) -> None:
+        events.append(message)
+        # Read the referenced region while the file is still open, like a real
+        # server consuming the zerocopysend message would.
+        if message["type"] == "http.response.zerocopysend":
+            assert not message["file"].closed
+            body.extend(os.pread(message["file"].fileno(), message["count"], message["offset"]))
+        elif message["type"] == "http.response.body":
+            body.extend(message.get("body", b""))
+
+    await app(scope, receive, send)
+
+    assert events[0]["type"] == "http.response.start"
+    zero_messages = [m for m in events if m["type"] == "http.response.zerocopysend"]
+    assert zero_messages, "zerocopysend message must pass through the middleware"
+    for message in zero_messages:
+        assert hasattr(message["file"], "fileno")
+        assert message["file"].closed  # closed once the server is done consuming
+    if range_header == b"bytes=2-9":
+        assert bytes(body) == content[2:10]
+    else:
+        # Multipart: the boundary text is sent as body while each region uses
+        # zero-copy; both referenced file slices must be present verbatim.
+        assert content[0:4] in bytes(body)
+        assert content[12:16] in bytes(body)
+        assert bytes(body).startswith(b"--")
 
 
 def test_error_context_propagation(test_client_factory: TestClientFactory) -> None:

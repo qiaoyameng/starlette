@@ -343,8 +343,10 @@ class FileResponse(Response):
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         scope_type = scope["type"]
+        extensions = scope.get("extensions", {}) if scope_type == "http" else {}
         send_header_only = scope_type == "http" and scope["method"].upper() == "HEAD"
-        send_pathsend = scope_type == "http" and "http.response.pathsend" in scope.get("extensions", {})
+        send_pathsend = "http.response.pathsend" in extensions
+        send_zerocopysend = "http.response.zerocopysend" in extensions
         if scope_type == "websocket":
             send = self._wrap_websocket_denial_send(send)
 
@@ -370,7 +372,7 @@ class FileResponse(Response):
             or http_range is None
             or (http_if_range is not None and not self._should_use_range(http_if_range))
         ):
-            send_file = partial(self._handle_simple, send, send_header_only, send_pathsend)
+            send_file = partial(self._handle_simple, send, send_header_only, send_pathsend, send_zerocopysend)
         else:
             try:
                 ranges = self._parse_range_header(http_range, stat_result.st_size)
@@ -381,13 +383,30 @@ class FileResponse(Response):
                 return await response(scope, receive, send)
 
             if len(ranges) == 0:
-                send_file = partial(self._handle_simple, send, send_header_only, send_pathsend)
+                send_file = partial(self._handle_simple, send, send_header_only, send_pathsend, send_zerocopysend)
             elif len(ranges) == 1:
                 start, end = ranges[0]
-                send_file = partial(self._handle_single_range, send, start, end, stat_result.st_size, send_header_only)
+                send_file = partial(
+                    self._handle_single_range,
+                    send,
+                    start,
+                    end,
+                    stat_result.st_size,
+                    send_header_only,
+                    send_zerocopysend,
+                )
+                # `pathsend` can only serve the whole file, so a ranged response
+                # relies on `zerocopysend` or the chunked fallback instead.
                 send_pathsend = False
             else:
-                send_file = partial(self._handle_multiple_ranges, send, ranges, stat_result.st_size, send_header_only)
+                send_file = partial(
+                    self._handle_multiple_ranges,
+                    send,
+                    ranges,
+                    stat_result.st_size,
+                    send_header_only,
+                    send_zerocopysend,
+                )
                 send_pathsend = False
 
         spec_version = tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split(".")))
@@ -420,7 +439,13 @@ class FileResponse(Response):
             with anyio.CancelScope(shield=True):
                 await file.aclose()
 
-    async def _handle_simple(self, send: Send, send_header_only: bool, send_pathsend: bool) -> None:
+    async def _handle_simple(
+        self,
+        send: Send,
+        send_header_only: bool,
+        send_pathsend: bool,
+        send_zerocopysend: bool,
+    ) -> None:
         await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
         if send_header_only:
             await send({"type": "http.response.body", "body": b"", "more_body": False})
@@ -428,14 +453,44 @@ class FileResponse(Response):
             await send({"type": "http.response.pathsend", "path": str(self.path)})
         else:
             async with self._open_file() as file:
-                more_body = True
-                while more_body:
-                    chunk = await file.read(self.chunk_size)
-                    more_body = len(chunk) == self.chunk_size
-                    await send({"type": "http.response.body", "body": chunk, "more_body": more_body})
+                if send_zerocopysend:
+                    await self._zerocopy_send(send, file, 0, int(self.headers["content-length"]), more_body=False)
+                else:
+                    more_body = True
+                    while more_body:
+                        chunk = await file.read(self.chunk_size)
+                        more_body = len(chunk) == self.chunk_size
+                        await send({"type": "http.response.body", "body": chunk, "more_body": more_body})
+
+    async def _zerocopy_send(
+        self,
+        send: Send,
+        file: anyio.AsyncFile[bytes],
+        offset: int,
+        count: int,
+        more_body: bool,
+    ) -> None:
+        # The server consumes the file region described by `offset`/`count`
+        # through its own file descriptor before this awaitable returns, so the
+        # caller must keep `file` open until then.
+        await send(
+            {
+                "type": "http.response.zerocopysend",
+                "file": file.wrapped,
+                "offset": offset,
+                "count": count,
+                "more_body": more_body,
+            }
+        )
 
     async def _handle_single_range(
-        self, send: Send, start: int, end: int, file_size: int, send_header_only: bool
+        self,
+        send: Send,
+        start: int,
+        end: int,
+        file_size: int,
+        send_header_only: bool,
+        send_zerocopysend: bool,
     ) -> None:
         headers = MutableHeaders(raw=list(self.raw_headers))
         headers["content-range"] = f"bytes {start}-{end - 1}/{file_size}"
@@ -445,13 +500,16 @@ class FileResponse(Response):
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         else:
             async with self._open_file() as file:
-                await file.seek(start)
-                more_body = True
-                while more_body:
-                    chunk = await file.read(min(self.chunk_size, end - start))
-                    start += len(chunk)
-                    more_body = len(chunk) == self.chunk_size and start < end
-                    await send({"type": "http.response.body", "body": chunk, "more_body": more_body})
+                if send_zerocopysend:
+                    await self._zerocopy_send(send, file, start, end - start, more_body=False)
+                else:
+                    await file.seek(start)
+                    more_body = True
+                    while more_body:
+                        chunk = await file.read(min(self.chunk_size, end - start))
+                        start += len(chunk)
+                        more_body = len(chunk) == self.chunk_size and start < end
+                        await send({"type": "http.response.body", "body": chunk, "more_body": more_body})
 
     async def _handle_multiple_ranges(
         self,
@@ -459,6 +517,7 @@ class FileResponse(Response):
         ranges: list[tuple[int, int]],
         file_size: int,
         send_header_only: bool,
+        send_zerocopysend: bool,
     ) -> None:
         # In firefox and chrome, they use boundary with 95-96 bits entropy (that's roughly 13 bytes).
         boundary = token_hex(13)
@@ -474,14 +533,19 @@ class FileResponse(Response):
         else:
             async with self._open_file() as file:
                 for start, end in ranges:
+                    # Boundary text is always sent as a regular body; only the
+                    # file region is eligible for zero-copy transfer.
                     await send({"type": "http.response.body", "body": header_generator(start, end), "more_body": True})
-                    await file.seek(start)
-                    while start < end:
-                        chunk = await file.read(min(self.chunk_size, end - start))
-                        if not chunk:
-                            raise RuntimeError(f"File at path {self.path} is shorter than expected.")
-                        start += len(chunk)
-                        await send({"type": "http.response.body", "body": chunk, "more_body": True})
+                    if send_zerocopysend:
+                        await self._zerocopy_send(send, file, start, end - start, more_body=True)
+                    else:
+                        await file.seek(start)
+                        while start < end:
+                            chunk = await file.read(min(self.chunk_size, end - start))
+                            if not chunk:
+                                raise RuntimeError(f"File at path {self.path} is shorter than expected.")
+                            start += len(chunk)
+                            await send({"type": "http.response.body", "body": chunk, "more_body": True})
                     await send({"type": "http.response.body", "body": b"\r\n", "more_body": True})
                 await send(
                     {

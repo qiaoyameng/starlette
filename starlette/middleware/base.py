@@ -137,7 +137,8 @@ class BaseHTTPMiddleware:
                     return
 
                 if message["type"] == "http.response.pathsend" or (
-                    message["type"] == "http.response.body" and not message.get("more_body", False)
+                    message["type"] in {"http.response.body", "http.response.zerocopysend"}
+                    and not message.get("more_body", False)
                 ):
                     await response_sent.wait()
 
@@ -177,9 +178,14 @@ class BaseHTTPMiddleware:
 
             async def body_stream() -> BodyStreamGenerator:
                 async for message in recv_stream:
-                    if message["type"] == "http.response.pathsend":
+                    if message["type"] in {
+                        "http.response.pathsend",
+                        "http.response.zerocopysend",
+                    }:
                         yield message
-                        break
+                        if not message.get("more_body", False):
+                            break
+                        continue
                     assert message["type"] == "http.response.body", f"Unexpected message: {message}"
                     body = message.get("body", b"")
                     if body:
@@ -235,9 +241,13 @@ class _StreamingResponse(Response):
         should_close_body = True
         async for chunk in self.body_iterator:
             if isinstance(chunk, dict):
-                # We got an ASGI message which is not response body (eg: pathsend)
-                should_close_body = False
+                # We got an ASGI message which is not response body (eg: pathsend
+                # or zerocopysend). A terminal pathsend ends the response, while a
+                # `more_body` zerocopysend is followed by further messages.
                 await send(chunk)
+                if chunk["type"] == "http.response.pathsend" or not chunk.get("more_body", False):
+                    should_close_body = False
+                    break
                 continue
             await send({"type": "http.response.body", "body": chunk, "more_body": True})
 

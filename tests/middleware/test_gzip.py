@@ -4,6 +4,7 @@ import hashlib
 import zlib
 from pathlib import Path
 
+import anyio
 import pytest
 
 from starlette.applications import Starlette
@@ -253,6 +254,108 @@ async def test_gzip_ignored_for_pathsend_responses(tmpdir: Path) -> None:
     assert len(events) == 2
     assert events[0]["type"] == "http.response.start"
     assert events[1]["type"] == "http.response.pathsend"
+
+
+@pytest.mark.anyio
+async def test_gzip_ignored_for_zerocopysend_responses(tmpdir: Path) -> None:
+    path = tmpdir / "example.txt"
+    with path.open("wb") as file:
+        file.write(b"<file content>" * 1000)
+
+    events: list[Message] = []
+
+    async def endpoint(request: Request) -> FileResponse:
+        _ = await request.body()
+        return FileResponse(path)
+
+    app = Starlette(
+        routes=[Route("/", endpoint=endpoint)],
+        middleware=[Middleware(GZipMiddleware)],
+    )
+
+    scope = {
+        "type": "http",
+        "version": "3",
+        "method": "GET",
+        "path": "/",
+        "headers": [
+            (b"accept-encoding", b"gzip, text"),
+            (b"range", b"bytes=10-99"),
+        ],
+        "extensions": {"http.response.zerocopysend": {}},
+    }
+
+    sent_request = False
+
+    async def receive() -> Message:
+        nonlocal sent_request
+        if not sent_request:
+            sent_request = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await anyio.sleep_forever()
+        return {"type": "http.disconnect"}  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        events.append(message)
+
+    await app(scope, receive, send)
+
+    assert events[0]["type"] == "http.response.start"
+    assert events[0]["status"] == 206
+    zero_messages = [m for m in events if m["type"] == "http.response.zerocopysend"]
+    assert len(zero_messages) == 1
+    assert (zero_messages[0]["offset"], zero_messages[0]["count"]) == (10, 90)
+    assert b"content-encoding" not in dict((k.decode().lower(), v) for k, v in events[0]["headers"])
+
+
+@pytest.mark.anyio
+async def test_gzip_ignored_for_full_file_zerocopysend(tmpdir: Path) -> None:
+    path = tmpdir / "example.txt"
+    with path.open("wb") as file:
+        file.write(b"<file content>" * 1000)
+
+    events: list[Message] = []
+
+    async def endpoint(request: Request) -> FileResponse:
+        _ = await request.body()
+        return FileResponse(path)
+
+    app = Starlette(
+        routes=[Route("/", endpoint=endpoint)],
+        middleware=[Middleware(GZipMiddleware)],
+    )
+
+    scope = {
+        "type": "http",
+        "version": "3",
+        "method": "GET",
+        "path": "/",
+        "headers": [(b"accept-encoding", b"gzip, text")],
+        "extensions": {"http.response.zerocopysend": {}},
+    }
+
+    sent_request = False
+
+    async def receive() -> Message:
+        nonlocal sent_request
+        if not sent_request:
+            sent_request = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await anyio.sleep_forever()
+        return {"type": "http.disconnect"}  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        events.append(message)
+
+    await app(scope, receive, send)
+
+    assert events[0]["type"] == "http.response.start"
+    assert events[0]["status"] == 200
+    zero_messages = [m for m in events if m["type"] == "http.response.zerocopysend"]
+    assert len(zero_messages) == 1
+    assert zero_messages[0]["offset"] == 0
+    assert zero_messages[0]["more_body"] is False
+    assert b"content-encoding" not in dict((k.decode().lower(), v) for k, v in events[0]["headers"])
 
 
 def test_gzip_ignored_on_range_responses(tmp_path: Path, test_client_factory: TestClientFactory) -> None:
